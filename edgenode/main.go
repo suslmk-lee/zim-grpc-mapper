@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"../pb"
+	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
 )
 
