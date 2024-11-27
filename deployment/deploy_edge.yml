@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgenode
+  labels:
+    app: edgenode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edgenode
+  template:
+    metadata:
+      labels:
+        app: edgenode
+    spec:
+      nodeSelector:
+        # KubeEdge가 설치된 엣지 노드 이름
+        kubernetes.io/hostname: edge-node-1
+      containers:
+        - name: edgenode
+          image: edgenode:latest
+          env:
+            - name: CLOUDCORE_URL
+              value: "cloudcore:50051"
