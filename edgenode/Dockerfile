@@ -1,20 +1,27 @@
-# Use Go as the base image
-FROM golang:1.22 as builder
+FROM golang:1.22-alpine AS builder
 
-# Set working directory
+ENV GO111MODULE=on \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+RUN apk add --no-cache git
+
+ENV GOPROXY=direct
+
 WORKDIR /app
 
-# Copy files
+COPY go.mod go.sum ./
+
+RUN go mod download
 COPY . .
 
-# Build EdgeNode binary
-RUN go build -o edgenode main.go
+RUN go build -o /app/edgenode main.go
 
-# Use a minimal base image
-FROM alpine:latest
+FROM scratch
 
-# Copy binary from builder stage
-COPY --from=builder /app/edgenode /edgenode
+COPY --from=builder /app/edgenode .
 
-# Run the binary
-ENTRYPOINT ["/edgenode"]
+EXPOSE 50051
+
+CMD ["./edgenode"]

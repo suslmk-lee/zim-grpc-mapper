@@ -5,7 +5,7 @@ go 1.22.7
 toolchain go1.22.9
 
 require (
-	github.com/suslmk-lee/zim-grpc-mapper v0.0.0-20241127030942-8317cadd85e9
+	github.com/suslmk-lee/zim-grpc-mapper v1.0.0
 	google.golang.org/grpc v1.68.0
 )
 
@@ -16,5 +16,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
 	google.golang.org/protobuf v1.35.2 // indirect
 )
-
-replace github.com/suslmk-lee/zim-grpc-mapper => ../
