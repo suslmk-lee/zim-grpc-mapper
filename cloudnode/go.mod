@@ -1,10 +1,13 @@
-module cloudnode
+module github.com/suslmk-lee/zim-grpc-mapper/cloudnode
 
 go 1.22.7
 
 toolchain go1.22.9
 
-require google.golang.org/grpc v1.68.0
+require (
+	github.com/suslmk-lee/zim-grpc-mapper v0.0.0-20241127030942-8317cadd85e9
+	google.golang.org/grpc v1.68.0
+)
 
 require (
 	golang.org/x/net v0.29.0 // indirect
@@ -14,4 +17,4 @@ require (
 	google.golang.org/protobuf v1.35.2 // indirect
 )
 
-replace cloudnode/pb => ../pb
+replace github.com/suslmk-lee/zim-grpc-mapper => ../

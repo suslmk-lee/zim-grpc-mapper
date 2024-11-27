@@ -1,4 +1,4 @@
-module edgenode
+module github.com/suslmk-lee/zim-grpc-mapper/edgenode
 
 go 1.22.7
 
@@ -17,4 +17,4 @@ require (
 	google.golang.org/protobuf v1.35.2 // indirect
 )
 
-replace edgenode/pb => ../pb
+replace github.com/suslmk-lee/zim-grpc-mapper => ../
