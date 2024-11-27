@@ -1,3 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edgenode-config
+data:
+  CLOUDCORE_URL: "cloudcore:50051"
+
+---
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,4 +31,7 @@ spec:
           image: edgenode:latest
           env:
             - name: CLOUDCORE_URL
-              value: "cloudcore:50051"
+              valueFrom:
+                configMapKeyRef:
+                  name: edgenode-config
+                  key: CLOUDCORE_URL

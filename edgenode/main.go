@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
@@ -10,8 +11,14 @@ import (
 )
 
 func main() {
+	// 환경변수에서 CloudCore URL과 포트 가져오기
+	cloudCoreURL := os.Getenv("CLOUD_CORE_URL")
+	if cloudCoreURL == "" {
+		cloudCoreURL = "cloudcore-url:50051" // 기본값 설정
+	}
+
 	// CloudCore gRPC 서버 연결
-	conn, err := grpc.Dial("cloudcore-url:50051", grpc.WithInsecure())
+	conn, err := grpc.Dial(cloudCoreURL, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("Failed to connect to CloudCore: %v", err)
 	}
