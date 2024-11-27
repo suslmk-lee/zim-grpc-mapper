@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package sensor;
+
+option go_package = "./pb;pb";
+
+message StatusData {
+  double Tyield = 1;
+  double Dyield = 2;
+  double PF = 3;
+  double Pmax = 4;
+  double Pac = 5;
+  double Sac = 6;
+  double Uab = 7;
+  double Ubc = 8;
+  double Uca = 9;
+  double Ia = 10;
+  double Ib = 11;
+  double Ic = 12;
+  double Freq = 13;
+  double Tmod = 14;
+  double Tamb = 15;
+  string Mode = 16;
+  int32 Qac = 17;
+  double BusCapacitance = 18;
+  double AcCapacitance = 19;
+  double Pdc = 20;
+  double PmaxLim = 21;
+  double SmaxLim = 22;
+}
+
+message SensorData {
+  string Device = 1;
+  string Timestamp = 2;
+  int32 ProVer = 3;
+  int32 MinorVer = 4;
+  int64 SN = 5;
+  string Model = 6;
+  StatusData Status = 7;
+}
+
+service SensorService {
+  rpc SendSensorData (SensorData) returns (SensorResponse);
+}
+
+message SensorResponse {
+  string status = 1;
+}
