@@ -1,3 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudnode-config
+data:
+  DB_HOST: "133.186.209.209"
+  DB_PORT: "31763"
+  DB_NAME: "cp-db"
+  DB_SSLMODE: "disable"
+
+---
+apiVersion: v1
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyI0NGNlNzg5Yi1rcjEtcmVnaXN0cnkuY29udGFpbmVyLm5obmNsb3VkLmNvbS9jb250YWluZXItcGxhdGZvcm0tcmVnaXN0cnkiOnsidXNlcm5hbWUiOiJYQ0ExT2owRnFBOE9NaGFsT1VoSyIsInBhc3N3b3JkIjoiekdneG83WGxwazVvalk3diIsImF1dGgiOiJXRU5CTVU5cU1FWnhRVGhQVFdoaGJFOVZhRXM2ZWtkbmVHODNXR3h3YXpWdmFsazNkZz09In19fQ==
+kind: Secret
+metadata:
+  name: ncr
+type: kubernetes.io/dockerconfigjson
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+type: Opaque
+data:
+  DB_USER: YWRtaW4=  # echo -n 'admin' | base64
+  DB_PASSWORD: bWFzdGVy  # echo -n 'master' | base64
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,9 +46,19 @@ spec:
     spec:
       containers:
         - name: cloudcore
-          image: cloudcore:latest
+          image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/cloudnode:latest
           ports:
             - containerPort: 50051
+          env:
+            - name: PROFILE
+              value: "prod"
+          envFrom:
+            - configMapRef:
+                name: cloudnode-config
+            - secretRef:
+                name: db-credentials
+      imagePullSecrets:
+        - name: ncr
 ---
 apiVersion: v1
 kind: Service

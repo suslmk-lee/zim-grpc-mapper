@@ -3,8 +3,31 @@ kind: ConfigMap
 metadata:
   name: edgenode-config
 data:
-  CLOUDCORE_URL: "cloudcore:50051"
+  CLOUD_CORE_URL: "cloudcore:50051"
+  DB_HOST: "133.186.209.209"
+  DB_PORT: "31763"
+  DB_NAME: "cp-db"
+  DB_SSLMODE: "disable"
 
+---
+
+apiVersion: v1
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyI0NGNlNzg5Yi1rcjEtcmVnaXN0cnkuY29udGFpbmVyLm5obmNsb3VkLmNvbS9jb250YWluZXItcGxhdGZvcm0tcmVnaXN0cnkiOnsidXNlcm5hbWUiOiJYQ0ExT2owRnFBOE9NaGFsT1VoSyIsInBhc3N3b3JkIjoiekdneG83WGxwazVvalk3diIsImF1dGgiOiJXRU5CTVU5cU1FWnhRVGhQVFdoaGJFOVZhRXM2ZWtkbmVHODNXR3h3YXpWdmFsazNkZz09In19fQ==
+kind: Secret
+metadata:
+  name: ncr
+type: kubernetes.io/dockerconfigjson
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+type: Opaque
+data:
+  DB_USER: YWRtaW4=  # echo -n 'admin' | base64
+  DB_PASSWORD: bWFzdGVy  # echo -n 'master' | base64
 ---
 
 apiVersion: apps/v1
@@ -24,14 +47,18 @@ spec:
         app: edgenode
     spec:
       nodeSelector:
-        # KubeEdge가 설치된 엣지 노드 이름
-        kubernetes.io/hostname: edge-node-1
+        # KubeNode label 참조
+        kubernetes.io/node-role: edge
       containers:
         - name: edgenode
-          image: edgenode:latest
+          image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/edgenode:latest
           env:
-            - name: CLOUDCORE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: edgenode-config
-                  key: CLOUDCORE_URL
+            - name: PROFILE
+              value: "prod"
+          envFrom:
+            - configMapRef:
+                name: edgenode-config
+            - secretRef:
+                name: db-credentials
+      imagePullSecrets:
+        - name: ncr

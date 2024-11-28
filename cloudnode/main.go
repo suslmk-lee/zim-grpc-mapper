@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"net"
+	"os"
 
 	_ "github.com/lib/pq"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
@@ -49,8 +51,18 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 }
 
 func main() {
-	// PostgreSQL 연결 설정
-	connStr := "postgresql://user:password@localhost:5432/sensordb?sslmode=disable"
+	// PostgreSQL 연결 정보를 환경변수에서 가져오기
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "user")
+	dbPassword := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "sensordb")
+	dbSSLMode := getEnv("DB_SSLMODE", "disable")
+
+	// PostgreSQL 연결 문자열 생성
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode)
+	
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
@@ -77,4 +89,13 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
+}
+
+// getEnv 함수는 환경변수를 가져오며, 환경변수가 설정되지 않은 경우 기본값을 반환합니다.
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
 }
