@@ -7,10 +7,10 @@ toolchain go1.22.9
 require (
 	github.com/suslmk-lee/zim-grpc-mapper v1.0.0
 	google.golang.org/grpc v1.68.0
+	github.com/lib/pq v1.10.9
 )
 
 require (
-	github.com/lib/pq v1.10.9 // indirect
 	golang.org/x/net v0.29.0 // indirect
 	golang.org/x/sys v0.25.0 // indirect
 	golang.org/x/text v0.18.0 // indirect

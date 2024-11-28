@@ -31,7 +31,7 @@ func fetchSensorDataFromDB(db *sql.DB) ([]*pb.SensorData, error) {
 			   bus_capacitance, ac_capacitance, pdc, pmaxlim, smaxlim
 		FROM iot_data
 		WHERE sent_to_cloud = false
-		LIMIT 100`
+		LIMIT 500` // 한 번에 처리할 데이터 수 증가
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -65,15 +65,38 @@ func fetchSensorDataFromDB(db *sql.DB) ([]*pb.SensorData, error) {
 	return sensorDataList, nil
 }
 
-// 전송 완료된 데이터 업데이트
-func updateSentData(db *sql.DB, device, timestamp string) error {
-	query := `
+// 배치로 전송 완료된 데이터 업데이트
+func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) error {
+	if len(devices) == 0 || len(timestamps) == 0 {
+		return nil
+	}
+
+	// 트랜잭션 시작
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 배치 업데이트 쿼리 준비
+	stmt, err := tx.Prepare(`
 		UPDATE iot_data 
 		SET sent_to_cloud = true 
-		WHERE device = $1 AND timestamp = $2`
+		WHERE device = $1 AND timestamp = $2`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 
-	_, err := db.Exec(query, device, timestamp)
-	return err
+	// 배치로 업데이트 실행
+	for i := range devices {
+		_, err := stmt.Exec(devices[i], timestamps[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func main() {
@@ -115,8 +138,37 @@ func main() {
 
 	client := pb.NewSensorServiceClient(conn)
 
-	// 주기적으로 데이터를 전송
-	ticker := time.NewTicker(10 * time.Second)
+	// 작업자 수 설정
+	workerCount := 10
+	workChan := make(chan *pb.SensorData, 500)
+	resultChan := make(chan struct {
+		device    string
+		timestamp string
+		err       error
+	}, 500)
+
+	// 작업자 고루틴 시작
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for data := range workChan {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_, err := client.SendSensorData(ctx, data)
+				resultChan <- struct {
+					device    string
+					timestamp string
+					err       error
+				}{
+					device:    data.Device,
+					timestamp: data.Timestamp,
+					err:       err,
+				}
+				cancel()
+			}
+		}()
+	}
+
+	// 주기적으로 데이터를 전송 (1초 간격)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -128,28 +180,34 @@ func main() {
 		}
 
 		if len(sensorDataList) == 0 {
-			log.Println("No new sensor data to send")
 			continue
 		}
 
-		// 각 데이터를 CloudCore로 전송
+		// 성공한 전송 결과를 저장할 슬라이스
+		var successDevices []string
+		var successTimestamps []string
+
+		// 데이터를 작업 채널에 전송
 		for _, data := range sensorDataList {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			res, err := client.SendSensorData(ctx, data)
-			if err != nil {
-				log.Printf("Failed to send data for device %s: %v", data.Device, err)
-				cancel()
+			workChan <- data
+		}
+
+		// 결과 수집
+		for i := 0; i < len(sensorDataList); i++ {
+			result := <-resultChan
+			if result.err != nil {
+				log.Printf("Failed to send data for device %s: %v", result.device, result.err)
 				continue
 			}
-			cancel()
+			successDevices = append(successDevices, result.device)
+			successTimestamps = append(successTimestamps, result.timestamp)
+		}
 
-			// 전송 성공 시 데이터베이스 업데이트
-			if err := updateSentData(db, data.Device, data.Timestamp); err != nil {
-				log.Printf("Failed to update sent status: %v", err)
-				continue
+		// 성공한 데이터 배치 업데이트
+		if len(successDevices) > 0 {
+			if err := updateSentDataBatch(db, successDevices, successTimestamps); err != nil {
+				log.Printf("Failed to update sent status batch: %v", err)
 			}
-
-			log.Printf("Successfully sent data for device %s: %s", data.Device, res.Status)
 		}
 	}
 }

@@ -4,8 +4,8 @@ metadata:
   name: edgenode-config
 data:
   CLOUD_CORE_URL: "cloudcore:50051"
-  DB_HOST: "133.186.209.209"
-  DB_PORT: "31763"
+  DB_HOST: "postgresql-cp.edge-db"
+  DB_PORT: "5432"
   DB_NAME: "cp-db"
   DB_SSLMODE: "disable"
 
@@ -47,7 +47,6 @@ spec:
         app: edgenode
     spec:
       nodeSelector:
-        # KubeNode label 참조
         kubernetes.io/node-role: edge
       containers:
         - name: edgenode
