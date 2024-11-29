@@ -9,9 +9,75 @@ import (
 	"os"
 
 	_ "github.com/lib/pq"
+	"github.com/spf13/viper"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
 )
+
+var config *viper.Viper
+
+func initConfig() error {
+	profile := os.Getenv("PROFILE")
+	config = viper.New()
+
+	if profile == "prod" {
+		// 프로덕션 모드: 환경 변수 사용
+		config.SetEnvPrefix("")
+		config.AutomaticEnv()
+		return nil
+	}
+
+	config.SetConfigName("config")
+	config.SetConfigType("json")
+	config.AddConfigPath(".")
+
+	if err := config.ReadInConfig(); err != nil {
+		return fmt.Errorf("설정 파일 읽기 오류: %v", err)
+	}
+
+	return nil
+}
+
+func getConfigString(key, defaultValue string) string {
+	if config.IsSet(key) {
+		return config.GetString(key)
+	}
+	return defaultValue
+}
+
+func getDBConnStr() string {
+	if os.Getenv("PROFILE") == "prod" {
+		return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			getConfigString("DB_HOST", "localhost"),
+			getConfigString("DB_PORT", "5432"),
+			getConfigString("DB_USER", "postgres"),
+			getConfigString("DB_PASSWORD", ""),
+			getConfigString("DB_NAME", "sensordb"),
+			getConfigString("DB_SSLMODE", "disable"),
+		)
+	}
+
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		config.GetString("db.host"),
+		config.GetString("db.port"),
+		config.GetString("db.user"),
+		config.GetString("db.password"),
+		config.GetString("db.name"),
+		config.GetString("db.sslmode"),
+	)
+}
+
+func getServerAddress() string {
+	if os.Getenv("PROFILE") == "prod" {
+		host := getConfigString("SERVER_HOST", "0.0.0.0")
+		port := getConfigString("SERVER_PORT", "50051")
+		return fmt.Sprintf("%s:%s", host, port)
+	}
+
+	host := config.GetString("server.host")
+	port := config.GetString("server.port")
+	return fmt.Sprintf("%s:%s", host, port)
+}
 
 type server struct {
 	pb.UnimplementedSensorServiceServer
@@ -22,16 +88,15 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 	log.Printf("Received data: Device=%s, Timestamp=%s, Model=%s, Tyield=%.2f, Mode=%s",
 		req.Device, req.Timestamp, req.Model, req.Status.Tyield, req.Status.Mode)
 
-	// 데이터 삽입 쿼리
 	query := `
-		INSERT INTO sensor_data (
-			device, timestamp, prover, minorver, sn, model, tyield, dyield, pf, pmax, pac, sac,
+		INSERT INTO iot_data (
+			device, timestamp, pro_ver, minor_ver, sn, model, tyield, dyield, pf, pmax, pac, sac,
 			uab, ubc, uca, ia, ib, ic, freq, tmod, tamb, mode, qac,
-			bus_capacitance, ac_capacitance, pdc, pmaxlim, smaxlim
+			bus_capacitance, ac_capacitance, pdc, pmax_lim, smax_lim, is_sent
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
-			$24, $25, $26, $27, $28
+			$24, $25, $26, $27, $28, $29
 		)`
 
 	_, err := s.db.Exec(query,
@@ -40,6 +105,7 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 		req.Status.Uab, req.Status.Ubc, req.Status.Uca, req.Status.Ia, req.Status.Ib, req.Status.Ic,
 		req.Status.Freq, req.Status.Tmod, req.Status.Tamb, req.Status.Mode, req.Status.Qac,
 		req.Status.BusCapacitance, req.Status.AcCapacitance, req.Status.Pdc, req.Status.PmaxLim, req.Status.SmaxLim,
+		false, // is_sent 기본값 false
 	)
 
 	if err != nil {
@@ -51,53 +117,33 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 }
 
 func main() {
-	// PostgreSQL 연결 정보를 환경변수에서 가져오기
-	dbHost := getEnv("DB_HOST", "localhost")
-	dbPort := getEnv("DB_PORT", "5432")
-	dbUser := getEnv("DB_USER", "user")
-	dbPassword := getEnv("DB_PASSWORD", "password")
-	dbName := getEnv("DB_NAME", "sensordb")
-	dbSSLMode := getEnv("DB_SSLMODE", "disable")
+	// 설정 초기화
+	if err := initConfig(); err != nil {
+		log.Fatalf("설정 초기화 오류: %v", err)
+	}
 
-	// PostgreSQL 연결 문자열 생성
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode)
-
-	log.Println("connStr: ", connStr)
-
-	db, err := sql.Open("postgres", connStr)
+	db, err := sql.Open("postgres", getDBConnStr())
 	if err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
 
-	// 데이터베이스 연결 테스트
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping PostgreSQL: %v", err)
+		log.Fatalf("Failed to ping database: %v", err)
 	}
-
 	log.Println("Connected to PostgreSQL")
 
-	// gRPC 서버 설정
-	lis, err := net.Listen("tcp", ":50051")
+	// gRPC 서버 시작
+	lis, err := net.Listen("tcp", getServerAddress())
 	if err != nil {
-		log.Fatalf("Failed to listen on port 50051: %v", err)
+		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
-	pb.RegisterSensorServiceServer(grpcServer, &server{db: db})
+	s := grpc.NewServer()
+	pb.RegisterSensorServiceServer(s, &server{db: db})
+	log.Printf("Server listening at %v", lis.Addr())
 
-	log.Println("CloudCore gRPC server is running on port 50051")
-	if err := grpcServer.Serve(lis); err != nil {
+	if err := s.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
-}
-
-// getEnv 함수는 환경변수를 가져오며, 환경변수가 설정되지 않은 경우 기본값을 반환합니다.
-func getEnv(key, defaultValue string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	return value
 }

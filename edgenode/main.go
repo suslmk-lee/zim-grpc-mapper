@@ -3,17 +3,127 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
+	MQTT "github.com/eclipse/paho.mqtt.golang"
 	_ "github.com/lib/pq"
+	"github.com/spf13/viper"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
 )
 
-// getEnv 함수는 환경변수를 가져오며, 환경변수가 설정되지 않은 경우 기본값을 반환합니다.
+var (
+	dataSource  DataSource
+	mqttClient  MQTT.Client
+	dataChannel = make(chan *pb.SensorData, 100)
+	mu          sync.Mutex
+	config      *viper.Viper
+)
+
+func initConfig() error {
+	profile := os.Getenv("PROFILE")
+	config = viper.New()
+
+	if profile == "prod" {
+		config.SetEnvPrefix("")
+		config.AutomaticEnv()
+		return nil
+	}
+
+	config.SetConfigName("config")
+	config.SetConfigType("json")
+	config.AddConfigPath(".")
+
+	if err := config.ReadInConfig(); err != nil {
+		return fmt.Errorf("설정 파일 읽기 오류: %v", err)
+	}
+
+	return nil
+}
+
+func getConfigString(key, defaultValue string) string {
+	if config.IsSet(key) {
+		return config.GetString(key)
+	}
+	return defaultValue
+}
+
+func getMQTTConfig() MQTTConfig {
+	if os.Getenv("PROFILE") == "prod" {
+		return MQTTConfig{
+			Broker:   getConfigString("MQTT_BROKER", "localhost:1883"),
+			Topic:    getConfigString("MQTT_TOPIC", "sensors/data"),
+			ClientID: getConfigString("MQTT_CLIENT_ID", "edge-node"),
+			Username: getConfigString("MQTT_USERNAME", ""),
+			Password: getConfigString("MQTT_PASSWORD", ""),
+		}
+	}
+
+	return MQTTConfig{
+		Broker:   config.GetString("mqtt.broker"),
+		Topic:    config.GetString("mqtt.topic"),
+		ClientID: config.GetString("mqtt.client_id"),
+		Username: config.GetString("mqtt.username"),
+		Password: config.GetString("mqtt.password"),
+	}
+}
+
+func getDataSource() DataSource {
+	var source string
+	if os.Getenv("PROFILE") == "prod" {
+		source = getConfigString("DATA_SOURCE", "db")
+	} else {
+		source = config.GetString("data_source")
+	}
+
+	if source == "mqtt" {
+		return DataSourceMQTT
+	}
+	return DataSourceDB
+}
+
+func getDBConnStr() string {
+	if os.Getenv("PROFILE") == "prod" {
+		return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			getConfigString("DB_HOST", "localhost"),
+			getConfigString("DB_PORT", "5432"),
+			getConfigString("DB_USER", "postgres"),
+			getConfigString("DB_PASSWORD", ""),
+			getConfigString("DB_NAME", "sensordb"),
+			getConfigString("DB_SSLMODE", "disable"),
+		)
+	}
+
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		config.GetString("db.host"),
+		config.GetString("db.port"),
+		config.GetString("db.user"),
+		config.GetString("db.password"),
+		config.GetString("db.name"),
+		config.GetString("db.sslmode"),
+	)
+}
+
+type DataSource int
+
+const (
+	DataSourceDB DataSource = iota
+	DataSourceMQTT
+)
+
+type MQTTConfig struct {
+	Broker   string
+	Topic    string
+	ClientID string
+	Username string
+	Password string
+}
+
 func getEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -22,7 +132,37 @@ func getEnv(key, defaultValue string) string {
 	return value
 }
 
-// 데이터베이스에서 센서 데이터를 조회하는 함수
+func initMQTTClient(config MQTTConfig) error {
+	opts := MQTT.NewClientOptions()
+	opts.AddBroker(config.Broker)
+	opts.SetClientID(config.ClientID)
+	if config.Username != "" {
+		opts.SetUsername(config.Username)
+		opts.SetPassword(config.Password)
+	}
+
+	opts.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) {
+		var sensorData pb.SensorData
+		if err := json.Unmarshal(msg.Payload(), &sensorData); err != nil {
+			log.Printf("Error unmarshaling MQTT message: %v", err)
+			return
+		}
+		dataChannel <- &sensorData
+	})
+
+	client := MQTT.NewClient(opts)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("MQTT connection failed: %v", token.Error())
+	}
+
+	if token := client.Subscribe(config.Topic, 0, nil); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("MQTT subscription failed: %v", token.Error())
+	}
+
+	mqttClient = client
+	return nil
+}
+
 func fetchSensorDataFromDB(db *sql.DB) ([]*pb.SensorData, error) {
 	query := `
 		SELECT device, timestamp, prover, minorver, sn, model,
@@ -65,20 +205,17 @@ func fetchSensorDataFromDB(db *sql.DB) ([]*pb.SensorData, error) {
 	return sensorDataList, nil
 }
 
-// 배치로 전송 완료된 데이터 업데이트
 func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) error {
 	if len(devices) == 0 || len(timestamps) == 0 {
 		return nil
 	}
 
-	// 트랜잭션 시작
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 배치 업데이트 쿼리 준비
 	stmt, err := tx.Prepare(`
 		UPDATE iot_data 
 		SET sent_to_cloud = true 
@@ -88,7 +225,6 @@ func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) erro
 	}
 	defer stmt.Close()
 
-	// 배치로 업데이트 실행
 	for i := range devices {
 		_, err := stmt.Exec(devices[i], timestamps[i])
 		if err != nil {
@@ -99,46 +235,64 @@ func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) erro
 	return tx.Commit()
 }
 
-func main() {
-	// PostgreSQL 연결 정보를 환경변수에서 가져오기
-	dbHost := getEnv("DB_HOST", "localhost")
-	dbPort := getEnv("DB_PORT", "5432")
-	dbUser := getEnv("DB_USER", "user")
-	dbPassword := getEnv("DB_PASSWORD", "password")
-	dbName := getEnv("DB_NAME", "sensordb")
-	dbSSLMode := getEnv("DB_SSLMODE", "disable")
+var fileWriteMutexes sync.Map
 
-	// PostgreSQL 연결 문자열 생성
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode)
-
-	// 데이터베이스 연결
-	db, err := sql.Open("postgres", connStr)
+func writeDataToFile(data *pb.SensorData) error {
+	timestamp, err := time.Parse("2006-01-02 15:04:05", data.Timestamp)
 	if err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
-	}
-	defer db.Close()
-
-	// 데이터베이스 연결 테스트
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping PostgreSQL: %v", err)
+		return fmt.Errorf("timestamp 파싱 오류: %v", err)
 	}
 
-	log.Println("Connected to PostgreSQL")
+	dirPath := fmt.Sprintf("data/%s/%s", timestamp.Format("2006-01-02"), timestamp.Format("15"))
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return fmt.Errorf("디렉토리 생성 오류: %v", err)
+	}
 
-	// CloudCore URL 설정
-	cloudCoreURL := getEnv("CLOUD_CORE_URL", "cloudcore:50051")
+	filePath := fmt.Sprintf("%s/data_%s.json", dirPath, timestamp.Format("15"))
 
-	// CloudCore gRPC 서버 연결
-	conn, err := grpc.Dial(cloudCoreURL, grpc.WithInsecure())
+	mutexInterface, _ := fileWriteMutexes.LoadOrStore(filePath, &sync.Mutex{})
+	mutex := mutexInterface.(*sync.Mutex)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	var records []map[string]interface{}
+	if _, err := os.Stat(filePath); err == nil {
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("파일 읽기 오류: %v", err)
+		}
+		if len(fileData) > 0 {
+			if err := json.Unmarshal(fileData, &records); err != nil {
+				return fmt.Errorf("JSON 파싱 오류: %v", err)
+			}
+		}
+	}
+
+	var newData map[string]interface{}
+	dataJSON, err := json.Marshal(data)
 	if err != nil {
-		log.Fatalf("Failed to connect to CloudCore: %v", err)
+		return fmt.Errorf("데이터 마샬링 오류: %v", err)
 	}
-	defer conn.Close()
+	if err := json.Unmarshal(dataJSON, &newData); err != nil {
+		return fmt.Errorf("데이터 언마샬링 오류: %v", err)
+	}
 
-	client := pb.NewSensorServiceClient(conn)
+	records = append(records, newData)
 
-	// 작업자 수 설정
+	jsonData, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON 변환 오류: %v", err)
+	}
+
+	if err := os.WriteFile(filePath, jsonData, 0644); err != nil {
+		return fmt.Errorf("파일 쓰기 오류: %v", err)
+	}
+
+	log.Printf("데이터가 저장됨: %s (총 %d건)", filePath, len(records))
+	return nil
+}
+
+func processMQTTData(client pb.SensorServiceClient) {
 	workerCount := 10
 	workChan := make(chan *pb.SensorData, 500)
 	resultChan := make(chan struct {
@@ -147,7 +301,6 @@ func main() {
 		err       error
 	}, 500)
 
-	// 작업자 고루틴 시작
 	for i := 0; i < workerCount; i++ {
 		go func() {
 			for data := range workChan {
@@ -163,16 +316,35 @@ func main() {
 					err:       err,
 				}
 				cancel()
+
+				go func(d *pb.SensorData) {
+					if err := writeDataToFile(d); err != nil {
+						log.Printf("파일 저장 오류 (디바이스: %s): %v", d.Device, err)
+					}
+				}(data)
 			}
 		}()
 	}
 
-	// 주기적으로 데이터를 전송 (1초 간격)
+	for data := range dataChannel {
+		workChan <- data
+	}
+
+	for {
+		result := <-resultChan
+		if result.err != nil {
+			log.Printf("데이터 전송 실패 (디바이스: %s): %v", result.device, result.err)
+			continue
+		}
+		log.Printf("데이터 전송 성공 (디바이스: %s)", result.device)
+	}
+}
+
+func processDBData(db *sql.DB, client pb.SensorServiceClient) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// 데이터베이스에서 센서 데이터 조회
 		sensorDataList, err := fetchSensorDataFromDB(db)
 		if err != nil {
 			log.Printf("Failed to fetch sensor data: %v", err)
@@ -183,16 +355,40 @@ func main() {
 			continue
 		}
 
-		// 성공한 전송 결과를 저장할 슬라이스
 		var successDevices []string
 		var successTimestamps []string
 
-		// 데이터를 작업 채널에 전송
+		workerCount := 10
+		workChan := make(chan *pb.SensorData, 500)
+		resultChan := make(chan struct {
+			device    string
+			timestamp string
+			err       error
+		}, 500)
+
+		for i := 0; i < workerCount; i++ {
+			go func() {
+				for data := range workChan {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					_, err := client.SendSensorData(ctx, data)
+					resultChan <- struct {
+						device    string
+						timestamp string
+						err       error
+					}{
+						device:    data.Device,
+						timestamp: data.Timestamp,
+						err:       err,
+					}
+					cancel()
+				}
+			}()
+		}
+
 		for _, data := range sensorDataList {
 			workChan <- data
 		}
 
-		// 결과 수집
 		for i := 0; i < len(sensorDataList); i++ {
 			result := <-resultChan
 			if result.err != nil {
@@ -203,11 +399,62 @@ func main() {
 			successTimestamps = append(successTimestamps, result.timestamp)
 		}
 
-		// 성공한 데이터 배치 업데이트
 		if len(successDevices) > 0 {
 			if err := updateSentDataBatch(db, successDevices, successTimestamps); err != nil {
 				log.Printf("Failed to update sent status batch: %v", err)
 			}
 		}
+	}
+}
+
+func main() {
+	if err := initConfig(); err != nil {
+		log.Fatalf("설정 초기화 오류: %v", err)
+	}
+
+	dataSource = getDataSource()
+	log.Printf("Operating in %s mode", map[DataSource]string{
+		DataSourceDB:   "Database",
+		DataSourceMQTT: "MQTT",
+	}[dataSource])
+
+	var cloudCoreURL string
+	if os.Getenv("PROFILE") == "prod" {
+		cloudCoreURL = getConfigString("CLOUD_CORE_URL", "cloudcore:50051")
+	} else {
+		cloudCoreURL = config.GetString("cloud_core_url")
+	}
+
+	conn, err := grpc.Dial(cloudCoreURL, grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("Failed to connect to CloudCore: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewSensorServiceClient(conn)
+	log.Printf("Connected to CloudCore at %s", cloudCoreURL)
+
+	switch dataSource {
+	case DataSourceMQTT:
+		mqttConfig := getMQTTConfig()
+		if err := initMQTTClient(mqttConfig); err != nil {
+			log.Fatalf("Failed to initialize MQTT client: %v", err)
+		}
+		defer mqttClient.Disconnect(250)
+		processMQTTData(client)
+
+	case DataSourceDB:
+		db, err := sql.Open("postgres", getDBConnStr())
+		if err != nil {
+			log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+		}
+		defer db.Close()
+
+		if err := db.Ping(); err != nil {
+			log.Fatalf("Failed to ping PostgreSQL: %v", err)
+		}
+		log.Println("Connected to PostgreSQL")
+
+		processDBData(db, client)
 	}
 }

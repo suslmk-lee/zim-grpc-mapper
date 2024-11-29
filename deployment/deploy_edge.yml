@@ -3,11 +3,19 @@ kind: ConfigMap
 metadata:
   name: edgenode-config
 data:
+  # Common Configuration
   CLOUD_CORE_URL: "cloudcore:50051"
+  # Data Source Configuration (mqtt or db)
+  DATA_SOURCE: "mqtt"
+  # Database Configuration
   DB_HOST: "postgresql-cp.edge-db"
   DB_PORT: "5432"
   DB_NAME: "cp-db"
   DB_SSLMODE: "disable"
+  # MQTT Configuration
+  MQTT_BROKER: "mqtt.example.com:1883"
+  MQTT_TOPIC: "sensors/data"
+  MQTT_CLIENT_ID: "edge-node"
 
 ---
 
@@ -28,8 +36,8 @@ type: Opaque
 data:
   DB_USER: YWRtaW4=  # echo -n 'admin' | base64
   DB_PASSWORD: bWFzdGVy  # echo -n 'master' | base64
----
 
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,15 +57,16 @@ spec:
       nodeSelector:
         kubernetes.io/node-role: edge
       containers:
-        - name: edgenode
-          image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/edgenode:latest
-          env:
-            - name: PROFILE
-              value: "prod"
-          envFrom:
-            - configMapRef:
-                name: edgenode-config
-            - secretRef:
-                name: db-credentials
+      - name: edgenode
+        image: 44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry/edgenode:latest
+        imagePullPolicy: Always
+        env:
+          - name: PROFILE
+            value: "prod"
+        envFrom:
+        - configMapRef:
+            name: edgenode-config
+        - secretRef:
+            name: db-credentials
       imagePullSecrets:
-        - name: ncr
+      - name: ncr
