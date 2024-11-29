@@ -59,7 +59,7 @@ jobs:
 
       - name: Apply Kubernetes Deployment(CloudNode)
         run: |
-          kubectl apply -f deployment/deploy_cloud.yml
+          kubectl apply -f deployment/deploy_cloud.yml -n $NAMESPACE
 
       - name: Restart Kubernetes Deployment(CloudNode)
         run: |
@@ -67,7 +67,7 @@ jobs:
 
       - name: Apply Kubernetes Deployment(EdgeNode)
         run: |
-          kubectl apply -f deployment/deploy_edge.yml
+          kubectl apply -f deployment/deploy_edge.yml  -n $NAMESPACE
 
       - name: Restart Kubernetes Deployment(EdgeNode)
         run: |
