@@ -7,7 +7,7 @@ data:
   SERVER_HOST: "0.0.0.0"
   SERVER_PORT: "50051"
   # Database Configuration
-  DB_HOST: "postgresql-cp.cloud-db"
+  DB_HOST: "postgresql-cp.iot-db"
   DB_PORT: "5432"
   DB_NAME: "cp-db"
   DB_SSLMODE: "disable"
