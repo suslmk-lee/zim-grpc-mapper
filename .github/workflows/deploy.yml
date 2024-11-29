@@ -39,14 +39,16 @@ jobs:
         env:
           GITHUB_SHA: ${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/$CLOUDNODE_IMAGE:latest -f cloudnode/Dockerfile .
+          cd cloudnode
+          docker build -t $REGISTRY/$CLOUDNODE_IMAGE:latest .
           docker push $REGISTRY/$CLOUDNODE_IMAGE:latest
           
       - name: Build and Push EdgeNode Image
         env:
           GITHUB_SHA: ${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/$EDGENODE_IMAGE:latest -f edgenode/Dockerfile .
+          cd edgenode
+          docker build -t $REGISTRY/$EDGENODE_IMAGE:latest .
           docker push $REGISTRY/$EDGENODE_IMAGE:latest
 
       - name: Set up Kubernetes
@@ -69,4 +71,4 @@ jobs:
 
       - name: Restart Kubernetes Deployment(EdgeNode)
         run: |
-          kubectl rollout restart deployment/$EDGE_DEPLOYMENT_NAME -n $NAMESPACE
+          kubectl rollout restart deployment/$EDGENODE_DEPLOYMENT_NAME -n $NAMESPACE
