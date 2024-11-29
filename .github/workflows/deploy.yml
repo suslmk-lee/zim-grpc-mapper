@@ -1,0 +1,72 @@
+name: Build and Deploy to Kubernetes (K-PaaS)
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_NAME: "zim-iot-inverter-mapper"
+      CLOUDNODE_IMAGE: cloudnode
+      EDGENODE_IMAGE: edgenode
+      REGISTRY: "44ce789b-kr1-registry.container.nhncloud.com/container-platform-registry"
+      NAMESPACE: "iot-edge"
+      CLOUDNODE_DEPLOYMENT_NAME: "cloudnode"
+      EDGENODE_DEPLOYMENT_NAME: "edgenode"
+      CLUSTER_NAME: "dev-cluster"
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.22
+
+      - name: Log in to Container Registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: echo "${REGISTRY_PASSWORD}" | docker login $REGISTRY -u "${REGISTRY_USERNAME}" --password-stdin
+
+      - name: Build and Push CloudNode Image
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$CLOUDNODE_IMAGE:latest -f cloudnode/Dockerfile .
+          docker push $REGISTRY/$CLOUDNODE_IMAGE:latest
+          
+      - name: Build and Push EdgeNode Image
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$EDGENODE_IMAGE:latest -f edgenode/Dockerfile .
+          docker push $REGISTRY/$EDGENODE_IMAGE:latest
+
+      - name: Set up Kubernetes
+        uses: azure/k8s-set-context@v2
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_DATA }}
+
+      - name: Apply Kubernetes Deployment(CloudNode)
+        run: |
+          kubectl apply -f deployment/deploy_cloud.yml
+
+      - name: Restart Kubernetes Deployment(CloudNode)
+        run: |
+          kubectl rollout restart deployment/$CLOUDNODE_DEPLOYMENT_NAME -n $NAMESPACE
+
+      - name: Apply Kubernetes Deployment(EdgeNode)
+        run: |
+          kubectl apply -f deployment/deploy_edge.yml
+
+      - name: Restart Kubernetes Deployment(EdgeNode)
+        run: |
+          kubectl rollout restart deployment/$EDGE_DEPLOYMENT_NAME -n $NAMESPACE
