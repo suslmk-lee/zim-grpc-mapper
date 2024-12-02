@@ -237,38 +237,66 @@ func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) erro
 
 var fileWriteMutexes sync.Map
 
+func getDataPath() string {
+	if os.Getenv("PROFILE") == "prod" {
+		return "/app/data"
+	}
+	return "data"
+}
+
 func writeDataToFile(data *pb.SensorData) error {
-	baseDir := "/app/data"
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return fmt.Errorf("failed to create base directory: %v", err)
-	}
-
-	deviceDir := fmt.Sprintf("%s/%s", baseDir, data.Device)
-	if err := os.MkdirAll(deviceDir, 0755); err != nil {
-		return fmt.Errorf("failed to create device directory: %v", err)
-	}
-
-	filename := fmt.Sprintf("%s/%d.json", deviceDir, time.Now().UnixNano())
-	
-	// Get or create mutex for this device
-	var mutex sync.Mutex
-	actualMutex, _ := fileWriteMutexes.LoadOrStore(data.Device, &mutex)
-	deviceMutex := actualMutex.(*sync.Mutex)
-	
-	deviceMutex.Lock()
-	defer deviceMutex.Unlock()
-
-	file, err := os.Create(filename)
+	timestamp, err := time.Parse("2006-01-02 15:04:05", data.Timestamp)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(data); err != nil {
-		return fmt.Errorf("failed to write data: %v", err)
+		return fmt.Errorf("timestamp 파싱 오류: %v", err)
 	}
 
+	basePath := getDataPath()
+	dirPath := fmt.Sprintf("%s/%s/%s", basePath, timestamp.Format("2006-01-02"), timestamp.Format("15"))
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return fmt.Errorf("디렉토리 생성 오류: %v", err)
+	}
+
+	filePath := fmt.Sprintf("%s/data_%s.json", dirPath, timestamp.Format("15"))
+
+	mutexInterface, _ := fileWriteMutexes.LoadOrStore(filePath, &sync.Mutex{})
+	mutex := mutexInterface.(*sync.Mutex)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	var records []map[string]interface{}
+	if _, err := os.Stat(filePath); err == nil {
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("파일 읽기 오류: %v", err)
+		}
+		if len(fileData) > 0 {
+			if err := json.Unmarshal(fileData, &records); err != nil {
+				return fmt.Errorf("JSON 파싱 오류: %v", err)
+			}
+		}
+	}
+
+	var newData map[string]interface{}
+	dataJSON, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("데이터 마샬링 오류: %v", err)
+	}
+	if err := json.Unmarshal(dataJSON, &newData); err != nil {
+		return fmt.Errorf("데이터 언마샬링 오류: %v", err)
+	}
+
+	records = append(records, newData)
+
+	jsonData, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON 변환 오류: %v", err)
+	}
+
+	if err := os.WriteFile(filePath, jsonData, 0644); err != nil {
+		return fmt.Errorf("파일 쓰기 오류: %v", err)
+	}
+
+	log.Printf("데이터가 저장됨: %s (총 %d건)", filePath, len(records))
 	return nil
 }
 

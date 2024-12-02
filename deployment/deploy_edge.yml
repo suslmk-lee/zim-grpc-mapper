@@ -41,7 +41,7 @@ data:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: edge-data-pvc
+  name: edgenode-data-pvc
 spec:
   accessModes:
     - ReadWriteMany
@@ -76,17 +76,17 @@ spec:
         env:
           - name: PROFILE
             value: "prod"
+        volumeMounts:
+          - name: data-volume
+            mountPath: /app/data
         envFrom:
         - configMapRef:
             name: edgenode-config
         - secretRef:
             name: db-credentials
-        volumeMounts:
-        - name: edge-data
-          mountPath: /app/data
       volumes:
-      - name: edge-data
-        persistentVolumeClaim:
-          claimName: edge-data-pvc
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: edgenode-data-pvc
       imagePullSecrets:
       - name: ncr
