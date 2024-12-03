@@ -57,7 +57,7 @@ func getMQTTConfig() MQTTConfig {
 	if os.Getenv("PROFILE") == "prod" {
 		return MQTTConfig{
 			Broker:   getConfigString("MQTT_BROKER", "localhost:1883"),
-			Topic:    getConfigString("MQTT_TOPIC", "sensors/data"),
+			Topic:    getConfigString("MQTT_TOPIC", "iot/data"),
 			ClientID: getConfigString("MQTT_CLIENT_ID", "edge-node"),
 			Username: getConfigString("MQTT_USERNAME", ""),
 			Password: getConfigString("MQTT_PASSWORD", ""),
@@ -445,6 +445,7 @@ func main() {
 	switch dataSource {
 	case DataSourceMQTT:
 		mqttConfig := getMQTTConfig()
+		fmt.Println("Broker: ", mqttConfig.Broker, " Topic: ", mqttConfig.Topic, " ClientID: ", mqttConfig.ClientID)
 		if err := initMQTTClient(mqttConfig); err != nil {
 			log.Fatalf("Failed to initialize MQTT client: %v", err)
 		}
