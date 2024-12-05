@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/viper"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 )
 
 var config *viper.Viper
@@ -85,7 +86,19 @@ type server struct {
 }
 
 func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.SensorResponse, error) {
-	log.Printf("Received data: Device=%s, Timestamp=%s, Model=%s, Tyield=%.2f, Mode=%s",
+	if p, ok := peer.FromContext(ctx); ok {
+		log.Printf("[gRPC] 새로운 데이터 수신 시작 - Device: %s, Remote Address: %v",
+			req.Device, p.Addr)
+	} else {
+		log.Printf("[gRPC] 새로운 데이터 수신 시작 - Device: %s", req.Device)
+	}
+
+	if ctx.Err() != nil {
+		log.Printf("[gRPC] 컨텍스트 오류 발생 - Device: %s, Error: %v", req.Device, ctx.Err())
+		return nil, ctx.Err()
+	}
+
+	log.Printf("[gRPC] 데이터 내용 - Device: %s, Timestamp: %s, Model: %s, Tyield: %.2f, Mode: %s",
 		req.Device, req.Timestamp, req.Model, req.Status.Tyield, req.Status.Mode)
 
 	query := `
@@ -109,41 +122,69 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 	)
 
 	if err != nil {
-		log.Printf("Failed to insert data into PostgreSQL: %v", err)
-		return &pb.SensorResponse{Status: "Failed to save data"}, err
+		log.Printf("[gRPC] DB 저장 실패 - Device: %s, Error: %v", req.Device, err)
+		return nil, fmt.Errorf("데이터베이스 저장 오류: %v", err)
 	}
 
-	return &pb.SensorResponse{Status: "Data received and saved successfully"}, nil
+	log.Printf("[gRPC] 데이터 처리 완료 - Device: %s", req.Device)
+	return &pb.SensorResponse{Status: "success"}, nil
 }
 
 func main() {
+	log.Printf("[Server] 서버 시작 중...")
+
 	// 설정 초기화
 	if err := initConfig(); err != nil {
-		log.Fatalf("설정 초기화 오류: %v", err)
+		log.Fatalf("[Server] 설정 초기화 오류: %v", err)
 	}
+	log.Printf("[Server] 설정 초기화 완료")
 
+	// DB 연결
+	log.Printf("[Server] PostgreSQL 연결 시도 중...")
 	db, err := sql.Open("postgres", getDBConnStr())
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("[Server] DB 연결 실패: %v", err)
 	}
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
+		log.Fatalf("[Server] DB Ping 실패: %v", err)
 	}
-	log.Println("Connected to PostgreSQL")
+	log.Printf("[Server] PostgreSQL 연결 성공")
 
-	// gRPC 서버 시작
-	lis, err := net.Listen("tcp", getServerAddress())
+	// gRPC 서버 설정
+	serverAddress := getServerAddress()
+	log.Printf("[gRPC] 서버 주소 설정: %s", serverAddress)
+
+	lis, err := net.Listen("tcp", serverAddress)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("[gRPC] 리스닝 실패: %v", err)
 	}
 
-	s := grpc.NewServer()
+	// gRPC 서버 옵션 설정
+	opts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			if p, ok := peer.FromContext(ctx); ok {
+				log.Printf("[gRPC] 새로운 요청 - Method: %s, Peer Address: %v", info.FullMethod, p.Addr)
+			} else {
+				log.Printf("[gRPC] 새로운 요청 - Method: %s", info.FullMethod)
+			}
+
+			resp, err := handler(ctx, req)
+			if err != nil {
+				log.Printf("[gRPC] 요청 처리 실패 - Method: %s, Error: %v", info.FullMethod, err)
+			} else {
+				log.Printf("[gRPC] 요청 처리 성공 - Method: %s", info.FullMethod)
+			}
+			return resp, err
+		}),
+	}
+
+	s := grpc.NewServer(opts...)
 	pb.RegisterSensorServiceServer(s, &server{db: db})
-	log.Printf("Server listening at %v", lis.Addr())
+	log.Printf("[gRPC] 서버 시작됨 - 주소: %v", lis.Addr())
 
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+		log.Fatalf("[gRPC] 서버 실행 실패: %v", err)
 	}
 }
