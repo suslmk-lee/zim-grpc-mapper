@@ -152,7 +152,7 @@ func parseTimestampToMillis(timestamp string) (int64, error) {
 			return 0, fmt.Errorf("타임스탬프 파싱 실패: %v", err)
 		}
 	}
-	
+
 	// UTC로 변환하고 Unix 밀리초 반환
 	return t.UTC().UnixNano() / int64(time.Millisecond), nil
 }
@@ -211,7 +211,20 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 
 func startMQTTSubscriber(db *sql.DB) error {
 	mqttConfig := getMQTTConfig()
-	
+
+	// MQTT 설정 로그 출력
+	log.Printf("[MQTT] 설정 정보:")
+	log.Printf("  - Broker: %s", mqttConfig.Broker)
+	log.Printf("  - Topic: %s", mqttConfig.Topic)
+	log.Printf("  - Client ID: %s", mqttConfig.ClientID)
+	log.Printf("  - QoS: %d", mqttConfig.QoS)
+	log.Printf("  - Username: %s", func() string {
+		if mqttConfig.Username != "" {
+			return mqttConfig.Username
+		}
+		return "설정되지 않음"
+	}())
+
 	opts := mqtt.NewClientOptions().
 		AddBroker(fmt.Sprintf("tcp://%s", mqttConfig.Broker)).
 		SetClientID(mqttConfig.ClientID).
@@ -221,41 +234,59 @@ func startMQTTSubscriber(db *sql.DB) error {
 		SetConnectRetry(true).
 		SetMaxReconnectInterval(10 * time.Second)
 
+	// 연결 시도 로그
+	log.Printf("[MQTT] 브로커 연결 시도 중... (Broker: %s)", mqttConfig.Broker)
+
 	if mqttConfig.Username != "" {
 		opts.SetUsername(mqttConfig.Username)
 		opts.SetPassword(mqttConfig.Password)
+		log.Printf("[MQTT] 인증 정보 설정됨 (Username: %s)", mqttConfig.Username)
 	}
 
 	// 연결 상태 콜백
 	opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
-		log.Printf("[MQTT] 연결 끊김: %v", err)
+		log.Printf("[MQTT] 연결 끊김 - Error: %v", err)
+		log.Printf("[MQTT] 재연결 시도 중...")
 	})
 
 	opts.SetOnConnectHandler(func(client mqtt.Client) {
-		log.Printf("[MQTT] 브로커 연결 성공")
+		log.Printf("[MQTT] 브로커 연결 성공 (Broker: %s)", mqttConfig.Broker)
+		log.Printf("[MQTT] 토픽 구독 시도 중... (Topic: %s, QoS: %d)", mqttConfig.Topic, mqttConfig.QoS)
+
 		if token := client.Subscribe(mqttConfig.Topic, mqttConfig.QoS, func(client mqtt.Client, msg mqtt.Message) {
 			handleMQTTMessage(db, msg)
 		}); token.Wait() && token.Error() != nil {
-			log.Printf("[MQTT] 구독 오류: %v", token.Error())
+			log.Printf("[MQTT] 구독 실패 - Topic: %s, Error: %v", mqttConfig.Topic, token.Error())
+		} else {
+			log.Printf("[MQTT] 구독 성공 - Topic: %s", mqttConfig.Topic)
 		}
+	})
+
+	// 재연결 핸들러 추가
+	opts.SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+		log.Printf("[MQTT] 재연결 시도 중... (Broker: %s)", opts.Servers[0])
 	})
 
 	// MQTT 클라이언트 생성 및 연결
 	client := mqtt.NewClient(opts)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("MQTT 연결 실패: %v", token.Error())
+		return fmt.Errorf("[MQTT] 연결 실패: %v", token.Error())
 	}
 
-	log.Printf("[MQTT] 브로커 %s에 연결됨, 토픽: %s", mqttConfig.Broker, mqttConfig.Topic)
+	log.Printf("[MQTT] 초기화 완료")
+	log.Printf("[MQTT] 메시지 수신 대기 중...")
 	return nil
 }
 
 func handleMQTTMessage(db *sql.DB, msg mqtt.Message) {
-	log.Printf("[MQTT] 새로운 메시지 수신 - Topic: %s", msg.Topic())
+	start := time.Now()
+	log.Printf("[MQTT] 새로운 메시지 수신 - Topic: %s, QoS: %d, Size: %d bytes",
+		msg.Topic(), msg.Qos(), len(msg.Payload()))
 
 	var sensorData pb.SensorData
 	if err := json.Unmarshal(msg.Payload(), &sensorData); err != nil {
 		log.Printf("[MQTT] JSON 파싱 오류: %v", err)
+		log.Printf("[MQTT] 원본 메시지: %s", string(msg.Payload()))
 		return
 	}
 
@@ -266,8 +297,15 @@ func handleMQTTMessage(db *sql.DB, msg mqtt.Message) {
 		return
 	}
 
-	log.Printf("[MQTT] 데이터 내용 - Device: %s, Timestamp: %s (%d ms), Model: %s, Tyield: %.2f, Mode: %s",
-		sensorData.Device, sensorData.Timestamp, timestampMillis, sensorData.Model, sensorData.Status.Tyield, sensorData.Status.Mode)
+	log.Printf("[MQTT] 데이터 파싱 완료:")
+	log.Printf("  - Device: %s", sensorData.Device)
+	log.Printf("  - Timestamp: %s (%d ms)", sensorData.Timestamp, timestampMillis)
+	log.Printf("  - Model: %s", sensorData.Model)
+	log.Printf("  - Status:")
+	log.Printf("    * Tyield: %.2f", sensorData.Status.Tyield)
+	log.Printf("    * Mode: %s", sensorData.Status.Mode)
+	log.Printf("    * PF: %.2f", sensorData.Status.PF)
+	log.Printf("    * Pmax: %.2f", sensorData.Status.Pmax)
 
 	query := `
 		INSERT INTO iot_data (
@@ -286,7 +324,7 @@ func handleMQTTMessage(db *sql.DB, msg mqtt.Message) {
 		sensorData.Status.Uab, sensorData.Status.Ubc, sensorData.Status.Uca, sensorData.Status.Ia, sensorData.Status.Ib, sensorData.Status.Ic,
 		sensorData.Status.Freq, sensorData.Status.Tmod, sensorData.Status.Tamb, sensorData.Status.Mode, sensorData.Status.Qac,
 		sensorData.Status.BusCapacitance, sensorData.Status.AcCapacitance, sensorData.Status.Pdc, sensorData.Status.PmaxLim, sensorData.Status.SmaxLim,
-		false, // is_sent 기본값 false
+		false,
 	)
 
 	if err != nil {
@@ -294,7 +332,8 @@ func handleMQTTMessage(db *sql.DB, msg mqtt.Message) {
 		return
 	}
 
-	log.Printf("[MQTT] 데이터 처리 완료 - Device: %s", sensorData.Device)
+	duration := time.Since(start)
+	log.Printf("[MQTT] 데이터 처리 완료 - Device: %s (처리 시간: %v)", sensorData.Device, duration)
 }
 
 func main() {
@@ -347,8 +386,8 @@ func main() {
 			MaxConnectionIdle:     15 * time.Second,
 			MaxConnectionAge:      30 * time.Second,
 			MaxConnectionAgeGrace: 5 * time.Second,
-			Time:                 5 * time.Second,
-			Timeout:             1 * time.Second,
+			Time:                  5 * time.Second,
+			Timeout:               1 * time.Second,
 		}
 
 		kaep := keepalive.EnforcementPolicy{
@@ -362,7 +401,7 @@ func main() {
 			grpc.KeepaliveEnforcementPolicy(kaep),
 			grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 				start := time.Now()
-				
+
 				// 클라이언트 정보 로깅
 				if p, ok := peer.FromContext(ctx); ok {
 					log.Printf("[gRPC] 새로운 요청 - Method: %s, Peer Address: %v", info.FullMethod, p.Addr)
@@ -372,7 +411,7 @@ func main() {
 
 				// 요청 처리
 				resp, err := handler(ctx, req)
-				
+
 				// 처리 결과 로깅
 				duration := time.Since(start)
 				if err != nil {
@@ -380,7 +419,7 @@ func main() {
 				} else {
 					log.Printf("[gRPC] 요청 성공 - Method: %s, Duration: %v", info.FullMethod, duration)
 				}
-				
+
 				return resp, err
 			}),
 		}
@@ -388,7 +427,7 @@ func main() {
 		// gRPC 서버 시작
 		s := grpc.NewServer(opts...)
 		pb.RegisterSensorServiceServer(s, &server{db: db})
-		
+
 		log.Printf("[gRPC] 서버 시작...")
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("[gRPC] 서버 실행 실패: %v", err)

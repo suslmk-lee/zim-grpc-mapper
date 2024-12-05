@@ -380,53 +380,82 @@ func getMQTTPubConfig() MQTTPubConfig {
 	}
 }
 
-func initMQTTPubClient(config MQTTPubConfig) error {
-	opts := MQTT.NewClientOptions()
-	opts.AddBroker(config.Broker)
-	opts.SetClientID(config.ClientID)
-	if config.Username != "" {
-		opts.SetUsername(config.Username)
-		opts.SetPassword(config.Password)
+func startMQTTPublisher() error {
+	mqttConfig := getMQTTPubConfig()
+
+	// MQTT Publisher 설정 로그 출력
+	log.Printf("[MQTT Publisher] 설정 정보:")
+	log.Printf("  - Broker: %s", mqttConfig.Broker)
+	log.Printf("  - Topic: %s", mqttConfig.Topic)
+	log.Printf("  - Client ID: %s", mqttConfig.ClientID)
+	log.Printf("  - QoS: %d", mqttConfig.QoS)
+	log.Printf("  - Username: %s", func() string {
+		if mqttConfig.Username != "" {
+			return mqttConfig.Username
+		}
+		return "설정되지 않음"
+	}())
+
+	opts := MQTT.NewClientOptions().
+		AddBroker(fmt.Sprintf("tcp://%s", mqttConfig.Broker)).
+		SetClientID(mqttConfig.ClientID).
+		SetCleanSession(true).
+		SetOrderMatters(false).
+		SetAutoReconnect(true).
+		SetConnectRetry(true).
+		SetMaxReconnectInterval(10 * time.Second)
+
+	log.Printf("[MQTT Publisher] 브로커 연결 시도 중... (Broker: %s)", mqttConfig.Broker)
+
+	if mqttConfig.Username != "" {
+		opts.SetUsername(mqttConfig.Username)
+		opts.SetPassword(mqttConfig.Password)
+		log.Printf("[MQTT Publisher] 인증 정보 설정됨 (Username: %s)", mqttConfig.Username)
 	}
 
-	// 연결 관련 설정
-	opts.SetKeepAlive(60 * time.Second)
-	opts.SetPingTimeout(10 * time.Second)
-	opts.SetConnectTimeout(30 * time.Second)
-	opts.SetAutoReconnect(true)
-	opts.SetMaxReconnectInterval(10 * time.Second)
-
-	// 연결 콜백
-	opts.SetOnConnectHandler(func(client MQTT.Client) {
-		log.Printf("[MQTT Publisher] 브로커 연결 성공: %s", config.Broker)
+	opts.SetConnectionLostHandler(func(client MQTT.Client, err error) {
+		log.Printf("[MQTT Publisher] 연결 끊김 - Error: %v", err)
+		log.Printf("[MQTT Publisher] 재연결 시도 중...")
 	})
 
-	// 연결 끊김 콜백
-	opts.SetConnectionLostHandler(func(client MQTT.Client, err error) {
-		log.Printf("[MQTT Publisher] 브로커 연결 끊김: %v", err)
+	opts.SetOnConnectHandler(func(client MQTT.Client) {
+		log.Printf("[MQTT Publisher] 브로커 연결 성공 (Broker: %s)", mqttConfig.Broker)
+	})
+
+	// 재연결 핸들러 추가
+	opts.SetReconnectingHandler(func(client MQTT.Client, opts *MQTT.ClientOptions) {
+		log.Printf("[MQTT Publisher] 재연결 시도 중... (Broker: %s)", opts.Servers[0])
 	})
 
 	mqttPubClient = MQTT.NewClient(opts)
-	token := mqttPubClient.Connect()
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("MQTT Publisher 연결 실패: %v", token.Error())
+	if token := mqttPubClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("[MQTT Publisher] 연결 실패: %v", token.Error())
 	}
 
+	log.Printf("[MQTT Publisher] 초기화 완료")
 	return nil
 }
 
-func sendViaMQTT(data *pb.SensorData) error {
+func publishToMQTT(data *pb.SensorData) error {
+	if mqttPubClient == nil || !mqttPubClient.IsConnected() {
+		return fmt.Errorf("[MQTT Publisher] 클라이언트가 연결되지 않음")
+	}
+
+	mqttConfig := getMQTTPubConfig()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("JSON 변환 실패: %v", err)
+		return fmt.Errorf("[MQTT Publisher] JSON 변환 실패: %v", err)
 	}
 
-	pubConfig := getMQTTPubConfig()
-	token := mqttPubClient.Publish(pubConfig.Topic, pubConfig.QoS, false, jsonData)
+	start := time.Now()
+	token := mqttPubClient.Publish(mqttConfig.Topic, mqttConfig.QoS, false, jsonData)
 	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("MQTT 발행 실패: %v", token.Error())
+		return fmt.Errorf("[MQTT Publisher] 메시지 발행 실패: %v", token.Error())
 	}
 
+	duration := time.Since(start)
+	log.Printf("[MQTT Publisher] 메시지 발행 완료 - Topic: %s, Size: %d bytes, Duration: %v",
+		mqttConfig.Topic, len(jsonData), duration)
 	return nil
 }
 
@@ -468,7 +497,7 @@ func processMQTTData(client pb.SensorServiceClient) {
 					// MQTT로 전송
 					log.Printf("Worker %d: MQTT 전송 시도 (디바이스: %s)",
 						workerID, data.Device)
-					err = sendViaMQTT(data)
+					err = publishToMQTT(data)
 					if err != nil {
 						log.Printf("Worker %d: MQTT 전송 실패 (디바이스: %s): %v",
 							workerID, data.Device, err)
@@ -598,8 +627,7 @@ func main() {
 
 	// 전송용 MQTT 클라이언트 초기화 (MQTT 전송 모드일 때만)
 	if transportMode == TransportMQTT {
-		mqttPubConfig := getMQTTPubConfig()
-		if err := initMQTTPubClient(mqttPubConfig); err != nil {
+		if err := startMQTTPublisher(); err != nil {
 			log.Fatalf("MQTT Publisher 초기화 실패: %v", err)
 		}
 		defer mqttPubClient.Disconnect(250)
