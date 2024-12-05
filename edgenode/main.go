@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,13 +19,38 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var (
-	dataSource  DataSource
-	mqttClient  MQTT.Client
-	dataChannel = make(chan *pb.SensorData, 100)
-	mu          sync.Mutex
-	config      *viper.Viper
+const (
+	TransportGRPC = "grpc"
+	TransportMQTT = "mqtt"
 )
+
+var (
+	dataSource    DataSource
+	mqttClient    MQTT.Client // 데이터 수신용 MQTT 클라이언트
+	mqttPubClient MQTT.Client // 데이터 전송용 MQTT 클라이언트
+	dataChannel   = make(chan *pb.SensorData, 100)
+	mu            sync.Mutex
+	config        *viper.Viper
+)
+
+// 기존 MQTT 설정 (수신용)
+type MQTTConfig struct {
+	Broker   string
+	Topic    string
+	ClientID string
+	Username string
+	Password string
+}
+
+// 새로운 MQTT 설정 (전송용)
+type MQTTPubConfig struct {
+	Broker   string
+	Topic    string
+	ClientID string
+	Username string
+	Password string
+	QoS      byte
+}
 
 func initConfig() error {
 	profile := os.Getenv("PROFILE")
@@ -48,8 +74,38 @@ func initConfig() error {
 }
 
 func getConfigString(key, defaultValue string) string {
+	if os.Getenv("PROFILE") == "prod" {
+		value := os.Getenv(key)
+		if value == "" {
+			return defaultValue
+		}
+		return value
+	}
+
 	if config.IsSet(key) {
 		return config.GetString(key)
+	}
+	return defaultValue
+}
+
+// 정수형 설정값을 가져오는 함수 추가
+func getConfigInt(key string, defaultValue int) int {
+	if os.Getenv("PROFILE") == "prod" {
+		value := os.Getenv(key)
+		if value == "" {
+			return defaultValue
+		}
+		// 문자열을 정수로 변환
+		intValue, err := strconv.Atoi(value)
+		if err != nil {
+			log.Printf("설정값 변환 오류 (%s): %v, 기본값 사용", key, err)
+			return defaultValue
+		}
+		return intValue
+	}
+
+	if config.IsSet(key) {
+		return config.GetInt(key)
 	}
 	return defaultValue
 }
@@ -116,14 +172,6 @@ const (
 	DataSourceDB DataSource = iota
 	DataSourceMQTT
 )
-
-type MQTTConfig struct {
-	Broker   string
-	Topic    string
-	ClientID string
-	Username string
-	Password string
-}
 
 func getEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
@@ -301,8 +349,91 @@ func writeDataToFile(data *pb.SensorData) error {
 	return nil
 }
 
+func getTransportMode() string {
+	mode := getConfigString("TRANSPORT_MODE", TransportGRPC)
+	if mode != TransportGRPC && mode != TransportMQTT {
+		log.Printf("[Config] 잘못된 전송 모드 설정: %s, 기본값(gRPC)으로 설정됨", mode)
+		return TransportGRPC
+	}
+	return mode
+}
+
+func getMQTTPubConfig() MQTTPubConfig {
+	if os.Getenv("PROFILE") == "prod" {
+		return MQTTPubConfig{
+			Broker:   getConfigString("PUB_MQTT_BROKER", "localhost:1883"),
+			Topic:    getConfigString("PUB_MQTT_TOPIC", "sensor/outbound"),
+			ClientID: getConfigString("PUB_MQTT_CLIENT_ID", "edge-publisher"),
+			Username: getConfigString("PUB_MQTT_USERNAME", ""),
+			Password: getConfigString("PUB_MQTT_PASSWORD", ""),
+			QoS:      byte(getConfigInt("PUB_MQTT_QOS", 1)),
+		}
+	}
+
+	return MQTTPubConfig{
+		Broker:   config.GetString("mqtt_pub.broker"),
+		Topic:    config.GetString("mqtt_pub.topic"),
+		ClientID: config.GetString("mqtt_pub.client_id"),
+		Username: config.GetString("mqtt_pub.username"),
+		Password: config.GetString("mqtt_pub.password"),
+		QoS:      byte(config.GetInt("mqtt_pub.qos")),
+	}
+}
+
+func initMQTTPubClient(config MQTTPubConfig) error {
+	opts := MQTT.NewClientOptions()
+	opts.AddBroker(config.Broker)
+	opts.SetClientID(config.ClientID)
+	if config.Username != "" {
+		opts.SetUsername(config.Username)
+		opts.SetPassword(config.Password)
+	}
+
+	// 연결 관련 설정
+	opts.SetKeepAlive(60 * time.Second)
+	opts.SetPingTimeout(10 * time.Second)
+	opts.SetConnectTimeout(30 * time.Second)
+	opts.SetAutoReconnect(true)
+	opts.SetMaxReconnectInterval(10 * time.Second)
+
+	// 연결 콜백
+	opts.SetOnConnectHandler(func(client MQTT.Client) {
+		log.Printf("[MQTT Publisher] 브로커 연결 성공: %s", config.Broker)
+	})
+
+	// 연결 끊김 콜백
+	opts.SetConnectionLostHandler(func(client MQTT.Client, err error) {
+		log.Printf("[MQTT Publisher] 브로커 연결 끊김: %v", err)
+	})
+
+	mqttPubClient = MQTT.NewClient(opts)
+	token := mqttPubClient.Connect()
+	if token.Wait() && token.Error() != nil {
+		return fmt.Errorf("MQTT Publisher 연결 실패: %v", token.Error())
+	}
+
+	return nil
+}
+
+func sendViaMQTT(data *pb.SensorData) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("JSON 변환 실패: %v", err)
+	}
+
+	pubConfig := getMQTTPubConfig()
+	token := mqttPubClient.Publish(pubConfig.Topic, pubConfig.QoS, false, jsonData)
+	if token.Wait() && token.Error() != nil {
+		return fmt.Errorf("MQTT 발행 실패: %v", token.Error())
+	}
+
+	return nil
+}
+
 func processMQTTData(client pb.SensorServiceClient) {
-	log.Printf("MQTT 데이터 처리 시작: worker 수=%d", 10)
+	transportMode := getTransportMode()
+	log.Printf("[Transport] 전송 모드: %s", transportMode)
+
 	workerCount := 10
 	workChan := make(chan *pb.SensorData, 500)
 	resultChan := make(chan struct {
@@ -332,23 +463,44 @@ func processMQTTData(client pb.SensorServiceClient) {
 					}
 				}(data)
 
-				// gRPC 전송 시도
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				log.Printf("Worker %d: gRPC 전송 시도 (디바이스: %s)",
-					workerID, data.Device)
-
-				// 재시도 로직 추가
 				var err error
-				for retries := 0; retries < 3; retries++ {
-					_, err = client.SendSensorData(ctx, data)
-					if err == nil {
-						break
+				if transportMode == TransportMQTT {
+					// MQTT로 전송
+					log.Printf("Worker %d: MQTT 전송 시도 (디바이스: %s)",
+						workerID, data.Device)
+					err = sendViaMQTT(data)
+					if err != nil {
+						log.Printf("Worker %d: MQTT 전송 실패 (디바이스: %s): %v",
+							workerID, data.Device, err)
+					} else {
+						log.Printf("Worker %d: MQTT 전송 성공 (디바이스: %s)",
+							workerID, data.Device)
 					}
-					log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s, 재시도: %d): %v",
-						workerID, data.Device, retries+1, err)
-					time.Sleep(time.Second * time.Duration(retries+1))
+				} else {
+					// gRPC로 전송
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+
+					log.Printf("Worker %d: gRPC 전송 시도 (디바이스: %s)",
+						workerID, data.Device)
+
+					for retries := 0; retries < 3; retries++ {
+						_, err = client.SendSensorData(ctx, data)
+						if err == nil {
+							break
+						}
+						log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s, 재시도: %d): %v",
+							workerID, data.Device, retries+1, err)
+						time.Sleep(time.Second * time.Duration(retries+1))
+					}
 				}
+
+				// 파일 저장 결과 확인
+				if ferr := <-fileErr; ferr != nil {
+					log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
+						workerID, data.Device, ferr)
+				}
+
 				resultChan <- struct {
 					device    string
 					timestamp string
@@ -366,15 +518,6 @@ func processMQTTData(client pb.SensorServiceClient) {
 	for data := range dataChannel {
 		log.Printf("메인 프로세스: 새 데이터 수신 (디바이스: %s)", data.Device)
 		workChan <- data
-	}
-
-	for {
-		result := <-resultChan
-		if result.err != nil {
-			log.Printf("처리 결과: 실패 (디바이스: %s): %v", result.device, result.err)
-			continue
-		}
-		log.Printf("처리 결과: 성공 (디바이스: %s)", result.device)
 	}
 }
 
@@ -450,40 +593,54 @@ func main() {
 		log.Fatalf("설정 초기화 오류: %v", err)
 	}
 
+	transportMode := getTransportMode()
+	log.Printf("전송 모드: %s", transportMode)
+
+	// 전송용 MQTT 클라이언트 초기화 (MQTT 전송 모드일 때만)
+	if transportMode == TransportMQTT {
+		mqttPubConfig := getMQTTPubConfig()
+		if err := initMQTTPubClient(mqttPubConfig); err != nil {
+			log.Fatalf("MQTT Publisher 초기화 실패: %v", err)
+		}
+		defer mqttPubClient.Disconnect(250)
+	}
+
+	// gRPC 클라이언트 설정 (gRPC 전송 모드일 때만)
+	var client pb.SensorServiceClient
+	if transportMode == TransportGRPC {
+		var cloudCoreURL string
+		if os.Getenv("PROFILE") == "prod" {
+			cloudCoreURL = getConfigString("CLOUD_CORE_URL", "cloudcore:50051")
+		} else {
+			cloudCoreURL = config.GetString("cloud_core_url")
+		}
+
+		opts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		}
+
+		log.Printf("Cloud Core 연결 시도 중... (%s)", cloudCoreURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		conn, err := grpc.DialContext(ctx, cloudCoreURL, opts...)
+		if err != nil {
+			log.Fatalf("Cloud Core 연결 실패: %v", err)
+		}
+		defer conn.Close()
+
+		client = pb.NewSensorServiceClient(conn)
+	}
+
+	// 데이터 수신용 MQTT 설정 및 연결
 	dataSource = getDataSource()
 	log.Printf("Operating in %s mode", map[DataSource]string{
 		DataSourceDB:   "Database",
 		DataSourceMQTT: "MQTT",
 	}[dataSource])
-
-	var cloudCoreURL string
-	if os.Getenv("PROFILE") == "prod" {
-		cloudCoreURL = getConfigString("CLOUD_CORE_URL", "cloudcore:50051")
-	} else {
-		cloudCoreURL = config.GetString("cloud_core_url")
-	}
-
-	// gRPC 연결 옵션 설정
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	}
-
-	// gRPC 연결 시도
-	log.Printf("Cloud Core 연결 시도 중... (%s)", cloudCoreURL)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(ctx, cloudCoreURL, opts...)
-	if err != nil {
-		log.Fatalf("Cloud Core 연결 실패: %v", err)
-	}
-	defer conn.Close()
-
-	client := pb.NewSensorServiceClient(conn)
-	log.Printf("Connected to CloudCore at %s", cloudCoreURL)
 
 	switch dataSource {
 	case DataSourceMQTT:
