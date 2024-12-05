@@ -301,6 +301,7 @@ func writeDataToFile(data *pb.SensorData) error {
 }
 
 func processMQTTData(client pb.SensorServiceClient) {
+	log.Printf("MQTT 데이터 처리 시작: worker 수=%d", 10)
 	workerCount := 10
 	workChan := make(chan *pb.SensorData, 500)
 	resultChan := make(chan struct {
@@ -310,10 +311,35 @@ func processMQTTData(client pb.SensorServiceClient) {
 	}, 500)
 
 	for i := 0; i < workerCount; i++ {
-		go func() {
+		go func(workerID int) {
+			log.Printf("Worker %d 시작", workerID)
 			for data := range workChan {
+				log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s)",
+					workerID, data.Device, data.Timestamp)
+
+				// 파일 쓰기 시도
+				fileErr := make(chan error, 1)
+				go func(d *pb.SensorData) {
+					if err := writeDataToFile(d); err != nil {
+						log.Printf("Worker %d: 파일 저장 오류 (디바이스: %s): %v",
+							workerID, d.Device, err)
+						fileErr <- err
+					} else {
+						log.Printf("Worker %d: 파일 저장 성공 (디바이스: %s)",
+							workerID, d.Device)
+						fileErr <- nil
+					}
+				}(data)
+
+				// gRPC 전송 시도
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				log.Printf("Worker %d: gRPC 전송 시도 (디바이스: %s)",
+					workerID, data.Device)
 				_, err := client.SendSensorData(ctx, data)
+
+				// 파일 쓰기 결과 확인
+				ferr := <-fileErr
+
 				resultChan <- struct {
 					device    string
 					timestamp string
@@ -323,28 +349,38 @@ func processMQTTData(client pb.SensorServiceClient) {
 					timestamp: data.Timestamp,
 					err:       err,
 				}
-				cancel()
 
-				go func(d *pb.SensorData) {
-					if err := writeDataToFile(d); err != nil {
-						log.Printf("파일 저장 오류 (디바이스: %s): %v", d.Device, err)
-					}
-				}(data)
+				if err != nil {
+					log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s): %v",
+						workerID, data.Device, err)
+				} else {
+					log.Printf("Worker %d: gRPC 전송 성공 (디바이스: %s)",
+						workerID, data.Device)
+				}
+
+				if ferr != nil && err != nil {
+					log.Printf("Worker %d: 심각 - 파일 저장 및 gRPC 전송 모두 실패 (디바이스: %s)",
+						workerID, data.Device)
+				}
+
+				cancel()
 			}
-		}()
+		}(i)
 	}
 
+	log.Printf("메인 프로세스: 데이터 채널 모니터링 시작")
 	for data := range dataChannel {
+		log.Printf("메인 프로세스: 새 데이터 수신 (디바이스: %s)", data.Device)
 		workChan <- data
 	}
 
 	for {
 		result := <-resultChan
 		if result.err != nil {
-			log.Printf("데이터 전송 실패 (디바이스: %s): %v", result.device, result.err)
+			log.Printf("처리 결과: 실패 (디바이스: %s): %v", result.device, result.err)
 			continue
 		}
-		log.Printf("데이터 전송 성공 (디바이스: %s)", result.device)
+		log.Printf("처리 결과: 성공 (디바이스: %s)", result.device)
 	}
 }
 
