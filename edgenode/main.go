@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/viper"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -332,14 +333,22 @@ func processMQTTData(client pb.SensorServiceClient) {
 				}(data)
 
 				// gRPC 전송 시도
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
 				log.Printf("Worker %d: gRPC 전송 시도 (디바이스: %s)",
 					workerID, data.Device)
-				_, err := client.SendSensorData(ctx, data)
 
-				// 파일 쓰기 결과 확인
-				ferr := <-fileErr
-
+				// 재시도 로직 추가
+				var err error
+				for retries := 0; retries < 3; retries++ {
+					_, err = client.SendSensorData(ctx, data)
+					if err == nil {
+						break
+					}
+					log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s, 재시도: %d): %v",
+						workerID, data.Device, retries+1, err)
+					time.Sleep(time.Second * time.Duration(retries+1))
+				}
 				resultChan <- struct {
 					device    string
 					timestamp string
@@ -349,21 +358,6 @@ func processMQTTData(client pb.SensorServiceClient) {
 					timestamp: data.Timestamp,
 					err:       err,
 				}
-
-				if err != nil {
-					log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s): %v",
-						workerID, data.Device, err)
-				} else {
-					log.Printf("Worker %d: gRPC 전송 성공 (디바이스: %s)",
-						workerID, data.Device)
-				}
-
-				if ferr != nil && err != nil {
-					log.Printf("Worker %d: 심각 - 파일 저장 및 gRPC 전송 모두 실패 (디바이스: %s)",
-						workerID, data.Device)
-				}
-
-				cancel()
 			}
 		}(i)
 	}
@@ -469,9 +463,22 @@ func main() {
 		cloudCoreURL = config.GetString("cloud_core_url")
 	}
 
-	conn, err := grpc.Dial(cloudCoreURL, grpc.WithInsecure())
+	// gRPC 연결 옵션 설정
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	}
+
+	// gRPC 연결 시도
+	log.Printf("Cloud Core 연결 시도 중... (%s)", cloudCoreURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, cloudCoreURL, opts...)
 	if err != nil {
-		log.Fatalf("Failed to connect to CloudCore: %v", err)
+		log.Fatalf("Cloud Core 연결 실패: %v", err)
 	}
 	defer conn.Close()
 
