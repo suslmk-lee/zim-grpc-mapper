@@ -7,11 +7,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/spf13/viper"
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/peer"
 )
 
@@ -161,29 +163,54 @@ func main() {
 		log.Fatalf("[gRPC] 리스닝 실패: %v", err)
 	}
 
+	// keepalive 정책 설정
+	kasp := keepalive.ServerParameters{
+		MaxConnectionIdle:     15 * time.Second,
+		MaxConnectionAge:      30 * time.Second,
+		MaxConnectionAgeGrace: 5 * time.Second,
+		Time:                 5 * time.Second,
+		Timeout:             1 * time.Second,
+	}
+
+	kaep := keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+	}
+
 	// gRPC 서버 옵션 설정
 	opts := []grpc.ServerOption{
+		grpc.KeepaliveParams(kasp),
+		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			start := time.Now()
+			
+			// 클라이언트 정보 로깅
 			if p, ok := peer.FromContext(ctx); ok {
 				log.Printf("[gRPC] 새로운 요청 - Method: %s, Peer Address: %v", info.FullMethod, p.Addr)
 			} else {
-				log.Printf("[gRPC] 새로운 요청 - Method: %s", info.FullMethod)
+				log.Printf("[gRPC] 새로운 요청 - Method: %s (피어 정보 없음)", info.FullMethod)
 			}
 
+			// 요청 처리
 			resp, err := handler(ctx, req)
+			
+			// 처리 결과 로깅
+			duration := time.Since(start)
 			if err != nil {
-				log.Printf("[gRPC] 요청 처리 실패 - Method: %s, Error: %v", info.FullMethod, err)
+				log.Printf("[gRPC] 요청 실패 - Method: %s, Duration: %v, Error: %v", info.FullMethod, duration, err)
 			} else {
-				log.Printf("[gRPC] 요청 처리 성공 - Method: %s", info.FullMethod)
+				log.Printf("[gRPC] 요청 성공 - Method: %s, Duration: %v", info.FullMethod, duration)
 			}
+			
 			return resp, err
 		}),
 	}
 
+	// gRPC 서버 시작
 	s := grpc.NewServer(opts...)
 	pb.RegisterSensorServiceServer(s, &server{db: db})
-	log.Printf("[gRPC] 서버 시작됨 - 주소: %v", lis.Addr())
-
+	
+	log.Printf("[gRPC] 서버 시작...")
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("[gRPC] 서버 실행 실패: %v", err)
 	}
