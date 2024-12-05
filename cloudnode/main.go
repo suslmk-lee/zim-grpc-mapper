@@ -87,6 +87,22 @@ type server struct {
 	db *sql.DB // PostgreSQL 연결
 }
 
+// UTC 타임스탬프를 밀리초로 변환하는 함수
+func parseTimestampToMillis(timestamp string) (int64, error) {
+	// 타임스탬프 파싱 (예상 형식: "2006-01-02T15:04:05Z" 또는 "2006-01-02T15:04:05.000Z")
+	t, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		// RFC3339 형식이 아닌 경우 다른 형식 시도
+		t, err = time.Parse("2006-01-02 15:04:05", timestamp)
+		if err != nil {
+			return 0, fmt.Errorf("타임스탬프 파싱 실패: %v", err)
+		}
+	}
+	
+	// UTC로 변환하고 Unix 밀리초 반환
+	return t.UTC().UnixNano() / int64(time.Millisecond), nil
+}
+
 func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.SensorResponse, error) {
 	if p, ok := peer.FromContext(ctx); ok {
 		log.Printf("[gRPC] 새로운 데이터 수신 시작 - Device: %s, Remote Address: %v",
@@ -100,8 +116,15 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 		return nil, ctx.Err()
 	}
 
-	log.Printf("[gRPC] 데이터 내용 - Device: %s, Timestamp: %s, Model: %s, Tyield: %.2f, Mode: %s",
-		req.Device, req.Timestamp, req.Model, req.Status.Tyield, req.Status.Mode)
+	// 타임스탬프를 UTC 밀리초로 변환
+	timestampMillis, err := parseTimestampToMillis(req.Timestamp)
+	if err != nil {
+		log.Printf("[gRPC] 타임스탬프 변환 실패 - Device: %s, Error: %v", req.Device, err)
+		return nil, fmt.Errorf("타임스탬프 변환 오류: %v", err)
+	}
+
+	log.Printf("[gRPC] 데이터 내용 - Device: %s, Timestamp: %s (%d ms), Model: %s, Tyield: %.2f, Mode: %s",
+		req.Device, req.Timestamp, timestampMillis, req.Model, req.Status.Tyield, req.Status.Mode)
 
 	query := `
 		INSERT INTO iot_data (
@@ -114,8 +137,8 @@ func (s *server) SendSensorData(ctx context.Context, req *pb.SensorData) (*pb.Se
 			$24, $25, $26, $27, $28, $29
 		)`
 
-	_, err := s.db.Exec(query,
-		req.Device, req.Timestamp, req.ProVer, req.MinorVer, req.SN, req.Model,
+	_, err = s.db.Exec(query,
+		req.Device, timestampMillis, req.ProVer, req.MinorVer, req.SN, req.Model,
 		req.Status.Tyield, req.Status.Dyield, req.Status.PF, req.Status.Pmax, req.Status.Pac, req.Status.Sac,
 		req.Status.Uab, req.Status.Ubc, req.Status.Uca, req.Status.Ia, req.Status.Ib, req.Status.Ic,
 		req.Status.Freq, req.Status.Tmod, req.Status.Tamb, req.Status.Mode, req.Status.Qac,
