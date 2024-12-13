@@ -516,6 +516,33 @@ var (
     statsLock   sync.RWMutex
 )
 
+// 워커 모니터링을 위한 함수
+func monitorWorkers() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        statsLock.RLock()
+        for workerID, stats := range workerStats {
+            stats.mutex.Lock()
+            timeSinceLastProcess := time.Since(stats.lastProcessed)
+            processedCount := stats.processedCount
+            errorCount := stats.errorCount
+            stats.mutex.Unlock()
+
+            log.Printf("Worker %d 상태 - 처리된 데이터: %d, 에러: %d, 마지막 처리: %v 전",
+                workerID, processedCount, errorCount, timeSinceLastProcess)
+
+            // 워커가 오랫동안 처리하지 않았다면 경고
+            if timeSinceLastProcess > 2*time.Minute {
+                log.Printf("경고: Worker %d가 %v 동안 데이터를 처리하지 않았습니다.",
+                    workerID, timeSinceLastProcess)
+            }
+        }
+        statsLock.RUnlock()
+    }
+}
+
 // 링 버퍼 구현
 type RingBuffer struct {
     data     []*pb.SensorData
