@@ -608,45 +608,31 @@ func processMQTTData(client pb.SensorServiceClient) {
         statsLock.Unlock()
     }
 
-    // 워커 모니터링 고루틴 (이전과 동일)
-    go func() {
-        ticker := time.NewTicker(30 * time.Second)
-        defer ticker.Stop()
-
-        for range ticker.C {
-            statsLock.RLock()
-            for workerID, stats := range workerStats {
-                stats.mutex.Lock()
-                timeSinceLastProcess := time.Since(stats.lastProcessed)
-                processedCount := stats.processedCount
-                errorCount := stats.errorCount
-                stats.mutex.Unlock()
-
-                log.Printf("Worker %d 상태 - 처리된 데이터: %d, 에러: %d, 마지막 처리: %v 전",
-                    workerID, processedCount, errorCount, timeSinceLastProcess)
-
-                // 워커가 오랫동안 처리하지 않았다면 경고
-                if timeSinceLastProcess > 2*time.Minute {
-                    log.Printf("경고: Worker %d가 %v 동안 데이터를 처리하지 않았습니다.",
-                        workerID, timeSinceLastProcess)
-                }
-            }
-            statsLock.RUnlock()
-        }
-    }()
+    // 워커 모니터링 고루틴
+    go monitorWorkers()
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
+    // 데이터 수신 카운터
+    var receivedCount int64
+
     // 데이터 수신 고루틴
     go func() {
+        log.Printf("데이터 수신 고루틴 시작")
         for {
             select {
             case data, ok := <-dataChannel:
                 if !ok {
+                    log.Printf("데이터 채널이 닫혔습니다")
                     return
                 }
+                atomic.AddInt64(&receivedCount, 1)
                 ringBuffer.Put(data)
+                if atomic.LoadInt64(&receivedCount)%100 == 0 {
+                    log.Printf("총 수신된 데이터: %d, 현재 버퍼 크기: %d", 
+                        atomic.LoadInt64(&receivedCount), ringBuffer.Len())
+                }
             case <-ctx.Done():
                 return
             }
@@ -668,34 +654,20 @@ func processMQTTData(client pb.SensorServiceClient) {
                     log.Printf("Worker %d: 컨텍스트 취소로 종료합니다.", workerID)
                     return
                 default:
-                    // 링 버퍼에서 데이터 가져오기
                     if data, ok := ringBuffer.Get(); ok {
                         processStart := time.Now()
-                        log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s, 버퍼 크기: %d)",
-                            workerID, data.Device, data.Timestamp, ringBuffer.Len())
+                        log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s)",
+                            workerID, data.Device, data.Timestamp)
 
                         // 파일 쓰기 시도
-                        fileErr := make(chan error, 1)
-                        done := make(chan bool)
-                        go func(d *pb.SensorData) {
-                            defer close(done)
-                            if err := writeDataToFile(d); err != nil {
-                                fileErr <- err
-                            } else {
-                                fileErr <- nil
-                            }
-                        }(data)
-
-                        // 파일 쓰기 타임아웃 처리
-                        select {
-                        case <-time.After(10 * time.Second):
-                            log.Printf("Worker %d: 파일 쓰기 타임아웃 (디바이스: %s)",
-                                workerID, data.Device)
-                            fileErr <- fmt.Errorf("file write timeout")
-                        case <-done:
-                            // 파일 쓰기 완료
+                        if err := writeDataToFile(data); err != nil {
+                            log.Printf("Worker %d: 파일 쓰기 실패: %v", workerID, err)
+                            stats.mutex.Lock()
+                            stats.errorCount++
+                            stats.mutex.Unlock()
                         }
 
+                        // 데이터 전송
                         var err error
                         if transportMode == TransportMQTT {
                             err = publishToMQTT(data)
@@ -705,20 +677,12 @@ func processMQTTData(client pb.SensorServiceClient) {
                             gcancel()
                         }
 
-                        // 처리 결과 업데이트
-                        if ferr := <-fileErr; ferr != nil {
-                            log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
-                                workerID, data.Device, ferr)
-                            stats.mutex.Lock()
-                            stats.errorCount++
-                            stats.mutex.Unlock()
-                        }
-
                         stats.mutex.Lock()
                         stats.processedCount++
                         stats.lastProcessed = time.Now()
                         if err != nil {
                             stats.errorCount++
+                            log.Printf("Worker %d: 데이터 전송 실패: %v", workerID, err)
                         }
                         stats.mutex.Unlock()
 
@@ -737,8 +701,8 @@ func processMQTTData(client pb.SensorServiceClient) {
                             err:       err,
                         }
                     } else {
-                        // 데이터가 없으면 잠시 대기
-                        time.Sleep(100 * time.Millisecond)
+                        // 데이터가 없을 때는 짧게 대기
+                        time.Sleep(10 * time.Millisecond)
                     }
                 }
             }
@@ -747,17 +711,15 @@ func processMQTTData(client pb.SensorServiceClient) {
 
     // 버퍼 상태 모니터링
     go func() {
-        ticker := time.NewTicker(10 * time.Second)
+        ticker := time.NewTicker(5 * time.Second)
         defer ticker.Stop()
 
         for {
             select {
             case <-ticker.C:
                 bufferSize := ringBuffer.Len()
-                log.Printf("링 버퍼 상태 - 현재 크기: %d", bufferSize)
-                if bufferSize > 4000 { // 80% 이상 차면 경고
-                    log.Printf("경고: 링 버퍼가 거의 가득 찼습니다 (%d/5000)", bufferSize)
-                }
+                log.Printf("링 버퍼 상태 - 현재 크기: %d, 총 수신 데이터: %d", 
+                    bufferSize, atomic.LoadInt64(&receivedCount))
             case <-ctx.Done():
                 return
             }
