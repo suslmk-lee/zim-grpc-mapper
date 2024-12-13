@@ -464,89 +464,115 @@ func processMQTTData(client pb.SensorServiceClient) {
 	log.Printf("[Transport] 전송 모드: %s", transportMode)
 
 	workerCount := 10
-	workChan := make(chan *pb.SensorData, 500)
+	workChan := make(chan *pb.SensorData, 1000) // 버퍼 크기 증가
 	resultChan := make(chan struct {
 		device    string
 		timestamp string
 		err       error
-	}, 500)
+	}, 1000)
 
+	// 워커 종료를 위한 컨텍스트 추가
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
 		go func(workerID int) {
+			defer wg.Done()
 			log.Printf("Worker %d 시작", workerID)
-			for data := range workChan {
-				log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s)",
-					workerID, data.Device, data.Timestamp)
-
-				// 파일 쓰기 시도
-				fileErr := make(chan error, 1)
-				go func(d *pb.SensorData) {
-					if err := writeDataToFile(d); err != nil {
-						log.Printf("Worker %d: 파일 저장 오류 (디바이스: %s): %v",
-							workerID, d.Device, err)
-						fileErr <- err
-					} else {
-						log.Printf("Worker %d: 파일 저장 성공 (디바이스: %s)",
-							workerID, d.Device)
-						fileErr <- nil
+			for {
+				select {
+				case data, ok := <-workChan:
+					if !ok {
+						log.Printf("Worker %d: 채널이 닫혔습니다. 종료합니다.", workerID)
+						return
 					}
-				}(data)
+					log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s)",
+						workerID, data.Device, data.Timestamp)
 
-				var err error
-				if transportMode == TransportMQTT {
-					// MQTT로 전송
-					log.Printf("Worker %d: MQTT 전송 시도 (디바이스: %s)",
-						workerID, data.Device)
-					err = publishToMQTT(data)
-					if err != nil {
-						log.Printf("Worker %d: MQTT 전송 실패 (디바이스: %s): %v",
-							workerID, data.Device, err)
-					} else {
-						log.Printf("Worker %d: MQTT 전송 성공 (디바이스: %s)",
-							workerID, data.Device)
-					}
-				} else {
-					// gRPC로 전송
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					log.Printf("Worker %d: gRPC 전송 시도 (디바이스: %s)",
-						workerID, data.Device)
-
-					for retries := 0; retries < 3; retries++ {
-						_, err = client.SendSensorData(ctx, data)
-						if err == nil {
-							break
+					// 파일 쓰기 시도 (타임아웃 추가)
+					fileErr := make(chan error, 1)
+					done := make(chan bool)
+					go func(d *pb.SensorData) {
+						defer close(done)
+						if err := writeDataToFile(d); err != nil {
+							fileErr <- err
+						} else {
+							fileErr <- nil
 						}
-						log.Printf("Worker %d: gRPC 전송 실패 (디바이스: %s, 재시도: %d): %v",
-							workerID, data.Device, retries+1, err)
-						time.Sleep(time.Second * time.Duration(retries+1))
+					}(data)
+
+					// 파일 쓰기 타임아웃 처리
+					select {
+					case <-time.After(10 * time.Second):
+						log.Printf("Worker %d: 파일 쓰기 타임아웃 (디바이스: %s)",
+							workerID, data.Device)
+						fileErr <- fmt.Errorf("file write timeout")
+					case <-done:
+						// 파일 쓰기 완료
 					}
-				}
 
-				// 파일 저장 결과 확인
-				if ferr := <-fileErr; ferr != nil {
-					log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
-						workerID, data.Device, ferr)
-				}
+					var err error
+					if transportMode == TransportMQTT {
+						err = publishToMQTT(data)
+					} else {
+						// gRPC 타임아웃 증가
+						gctx, gcancel := context.WithTimeout(ctx, 30*time.Second)
+						_, err = client.SendSensorData(gctx, data)
+						gcancel()
+					}
 
-				resultChan <- struct {
-					device    string
-					timestamp string
-					err       error
-				}{
-					device:    data.Device,
-					timestamp: data.Timestamp,
-					err:       err,
+					// 파일 저장 결과 확인
+					if ferr := <-fileErr; ferr != nil {
+						log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
+							workerID, data.Device, ferr)
+					}
+
+					resultChan <- struct {
+						device    string
+						timestamp string
+						err       error
+					}{
+						device:    data.Device,
+						timestamp: data.Timestamp,
+						err:       err,
+					}
+				case <-ctx.Done():
+					log.Printf("Worker %d: 컨텍스트 취소로 종료합니다.", workerID)
+					return
 				}
 			}
 		}(i)
 	}
 
+	// 메인 프로세스 모니터링
 	log.Printf("메인 프로세스: 데이터 채널 모니터링 시작")
-	for data := range dataChannel {
-		log.Printf("메인 프로세스: 새 데이터 수신 (디바이스: %s)", data.Device)
-		workChan <- data
+	healthCheckTicker := time.NewTicker(1 * time.Minute)
+	defer healthCheckTicker.Stop()
+
+	lastDataTime := time.Now()
+	for {
+		select {
+		case data, ok := <-dataChannel:
+			if !ok {
+				log.Printf("메인 프로세스: 데이터 채널이 닫혔습니다.")
+				close(workChan)
+				wg.Wait()
+				return
+			}
+			lastDataTime = time.Now()
+			log.Printf("메인 프로세스: 새 데이터 수신 (디바이스: %s)", data.Device)
+			select {
+			case workChan <- data:
+			case <-time.After(5 * time.Second):
+				log.Printf("메인 프로세스: 작업 채널이 가득 찼습니다. 데이터 드롭: %s", data.Device)
+			}
+		case <-healthCheckTicker.C:
+			if time.Since(lastDataTime) > 5*time.Minute {
+				log.Printf("경고: 마지막 데이터 수신 후 5분이 경과했습니다. 마지막 수신: %v", lastDataTime)
+			}
+		}
 	}
 }
 
