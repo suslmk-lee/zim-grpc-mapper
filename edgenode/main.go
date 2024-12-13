@@ -17,6 +17,7 @@ import (
 	pb "github.com/suslmk-lee/zim-grpc-mapper/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/connectivity"
 )
 
 const (
@@ -286,11 +287,32 @@ func updateSentDataBatch(db *sql.DB, devices []string, timestamps []string) erro
 
 var fileWriteMutexes sync.Map
 
-func getDataPath() string {
-	if os.Getenv("PROFILE") == "prod" {
-		return "/app/data"
+// 파일 쓰기를 위한 버퍼 관리
+type FileBuffer struct {
+	records []map[string]interface{}
+	mutex   sync.Mutex
+	lastFlush time.Time
+}
+
+var (
+	fileBuffers = make(map[string]*FileBuffer)
+	bufferMutex sync.Mutex
+)
+
+func getOrCreateBuffer(filePath string) *FileBuffer {
+	bufferMutex.Lock()
+	defer bufferMutex.Unlock()
+	
+	if buffer, exists := fileBuffers[filePath]; exists {
+		return buffer
 	}
-	return "data"
+	
+	buffer := &FileBuffer{
+		records: make([]map[string]interface{}, 0),
+		lastFlush: time.Now(),
+	}
+	fileBuffers[filePath] = buffer
+	return buffer
 }
 
 func writeDataToFile(data *pb.SensorData) error {
@@ -306,24 +328,10 @@ func writeDataToFile(data *pb.SensorData) error {
 	}
 
 	filePath := fmt.Sprintf("%s/data_%s.json", dirPath, timestamp.Format("15"))
-
-	mutexInterface, _ := fileWriteMutexes.LoadOrStore(filePath, &sync.Mutex{})
-	mutex := mutexInterface.(*sync.Mutex)
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	var records []map[string]interface{}
-	if _, err := os.Stat(filePath); err == nil {
-		fileData, err := os.ReadFile(filePath)
-		if err != nil {
-			return fmt.Errorf("파일 읽기 오류: %v", err)
-		}
-		if len(fileData) > 0 {
-			if err := json.Unmarshal(fileData, &records); err != nil {
-				return fmt.Errorf("JSON 파싱 오류: %v", err)
-			}
-		}
-	}
+	buffer := getOrCreateBuffer(filePath)
+	
+	buffer.mutex.Lock()
+	defer buffer.mutex.Unlock()
 
 	var newData map[string]interface{}
 	dataJSON, err := json.Marshal(data)
@@ -334,9 +342,37 @@ func writeDataToFile(data *pb.SensorData) error {
 		return fmt.Errorf("데이터 언마샬링 오류: %v", err)
 	}
 
-	records = append(records, newData)
+	buffer.records = append(buffer.records, newData)
+	
+	// 버퍼가 100개 이상 쌓이거나 마지막 플러시로부터 10초가 지났으면 파일에 쓰기
+	if len(buffer.records) >= 100 || time.Since(buffer.lastFlush) > 10*time.Second {
+		if err := flushBufferToFile(filePath, buffer); err != nil {
+			return fmt.Errorf("버퍼 플러시 오류: %v", err)
+		}
+		buffer.lastFlush = time.Now()
+	}
 
-	jsonData, err := json.MarshalIndent(records, "", "  ")
+	log.Printf("데이터가 버퍼에 추가됨: %s (현재 버퍼 크기: %d)", filePath, len(buffer.records))
+	return nil
+}
+
+func flushBufferToFile(filePath string, buffer *FileBuffer) error {
+	var existingRecords []map[string]interface{}
+	
+	if _, err := os.Stat(filePath); err == nil {
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("파일 읽기 오류: %v", err)
+		}
+		if len(fileData) > 0 {
+			if err := json.Unmarshal(fileData, &existingRecords); err != nil {
+				return fmt.Errorf("JSON 파싱 오류: %v", err)
+			}
+		}
+	}
+
+	allRecords := append(existingRecords, buffer.records...)
+	jsonData, err := json.MarshalIndent(allRecords, "", "  ")
 	if err != nil {
 		return fmt.Errorf("JSON 변환 오류: %v", err)
 	}
@@ -345,8 +381,16 @@ func writeDataToFile(data *pb.SensorData) error {
 		return fmt.Errorf("파일 쓰기 오류: %v", err)
 	}
 
-	log.Printf("데이터가 저장됨: %s (총 %d건)", filePath, len(records))
+	buffer.records = make([]map[string]interface{}, 0)
+	log.Printf("버퍼가 파일에 플러시됨: %s (총 %d건)", filePath, len(allRecords))
 	return nil
+}
+
+func getDataPath() string {
+	if os.Getenv("PROFILE") == "prod" {
+		return "/app/data"
+	}
+	return "data"
 }
 
 func getTransportMode() string {
@@ -402,7 +446,6 @@ func startMQTTPublisher() error {
 		SetCleanSession(true).
 		SetOrderMatters(false).
 		SetAutoReconnect(true).
-		SetConnectRetry(true).
 		SetMaxReconnectInterval(10 * time.Second)
 
 	log.Printf("[MQTT Publisher] 브로커 연결 시도 중... (Broker: %s)", mqttConfig.Broker)
@@ -651,17 +694,35 @@ func main() {
 	transportMode := getTransportMode()
 	log.Printf("전송 모드: %s", transportMode)
 
-	// 전송용 MQTT 클라이언트 초기화 (MQTT 전송 모드일 때만)
-	if transportMode == TransportMQTT {
-		if err := startMQTTPublisher(); err != nil {
-			log.Fatalf("MQTT Publisher 초기화 실패: %v", err)
+	// 버퍼 플러시를 위한 타이머 시작
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			bufferMutex.Lock()
+			for filePath, buffer := range fileBuffers {
+				buffer.mutex.Lock()
+				if len(buffer.records) > 0 {
+					if err := flushBufferToFile(filePath, buffer); err != nil {
+						log.Printf("주기적 버퍼 플러시 오류: %v", err)
+					}
+				}
+				buffer.mutex.Unlock()
+			}
+			bufferMutex.Unlock()
 		}
-		defer mqttPubClient.Disconnect(250)
-	}
+	}()
 
-	// gRPC 클라이언트 설정 (gRPC 전송 모드일 때만)
+	// gRPC 연결 관리를 위한 함수
 	var client pb.SensorServiceClient
-	if transportMode == TransportGRPC {
+	var conn *grpc.ClientConn
+	
+	setupGRPCConnection := func() error {
+		if conn != nil {
+			conn.Close()
+		}
+
 		var cloudCoreURL string
 		if os.Getenv("PROFILE") == "prod" {
 			cloudCoreURL = getConfigString("CLOUD_CORE_URL", "cloudcore:50051")
@@ -671,7 +732,6 @@ func main() {
 
 		opts := []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
 			grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
 			grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 		}
@@ -680,13 +740,45 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		conn, err := grpc.DialContext(ctx, cloudCoreURL, opts...)
+		var err error
+		conn, err = grpc.DialContext(ctx, cloudCoreURL, opts...)
 		if err != nil {
-			log.Fatalf("Cloud Core 연결 실패: %v", err)
+			return fmt.Errorf("Cloud Core 연결 실패: %v", err)
 		}
-		defer conn.Close()
 
 		client = pb.NewSensorServiceClient(conn)
+		return nil
+	}
+
+	// gRPC 연결 상태 모니터링 및 재연결
+	if transportMode == TransportGRPC {
+		if err := setupGRPCConnection(); err != nil {
+			log.Fatalf("초기 gRPC 연결 실패: %v", err)
+		}
+
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				if conn != nil && conn.GetState() == connectivity.TransientFailure {
+					log.Println("gRPC 연결 상태 불안정, 재연결 시도...")
+					if err := setupGRPCConnection(); err != nil {
+						log.Printf("gRPC 재연결 실패: %v", err)
+					} else {
+						log.Println("gRPC 재연결 성공")
+					}
+				}
+			}
+		}()
+	}
+
+	// 전송용 MQTT 클라이언트 초기화 (MQTT 전송 모드일 때만)
+	if transportMode == TransportMQTT {
+		if err := startMQTTPublisher(); err != nil {
+			log.Fatalf("MQTT Publisher 초기화 실패: %v", err)
+		}
+		defer mqttPubClient.Disconnect(250)
 	}
 
 	// 데이터 수신용 MQTT 설정 및 연결
