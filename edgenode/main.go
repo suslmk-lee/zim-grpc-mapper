@@ -516,13 +516,85 @@ var (
     statsLock   sync.RWMutex
 )
 
+// 링 버퍼 구현
+type RingBuffer struct {
+    data     []*pb.SensorData
+    size     int
+    head     int
+    tail     int
+    count    int
+    mu       sync.RWMutex
+    notEmpty chan struct{}
+    notFull  chan struct{}
+}
+
+func NewRingBuffer(size int) *RingBuffer {
+    return &RingBuffer{
+        data:     make([]*pb.SensorData, size),
+        size:     size,
+        notEmpty: make(chan struct{}, 1),
+        notFull:  make(chan struct{}, 1),
+    }
+}
+
+func (r *RingBuffer) Put(d *pb.SensorData) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    if r.count == r.size {
+        // 버퍼가 가득 찼을 때 가장 오래된 데이터를 제거
+        r.head = (r.head + 1) % r.size
+        r.count--
+        log.Printf("링 버퍼가 가득 참: 가장 오래된 데이터 제거")
+    }
+
+    r.data[r.tail] = d
+    r.tail = (r.tail + 1) % r.size
+    r.count++
+
+    if r.count == 1 {
+        select {
+        case r.notEmpty <- struct{}{}:
+        default:
+        }
+    }
+}
+
+func (r *RingBuffer) Get() (*pb.SensorData, bool) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    if r.count == 0 {
+        return nil, false
+    }
+
+    d := r.data[r.head]
+    r.head = (r.head + 1) % r.size
+    r.count--
+
+    if r.count == r.size-1 {
+        select {
+        case r.notFull <- struct{}{}:
+        default:
+        }
+    }
+
+    return d, true
+}
+
+func (r *RingBuffer) Len() int {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    return r.count
+}
+
 func processMQTTData(client pb.SensorServiceClient) {
     transportMode := getTransportMode()
     log.Printf("[Transport] 전송 모드: %s", transportMode)
 
-    // 워커 수와 채널 버퍼 크기 증가
-    workerCount := getConfigInt("WORKER_COUNT", 20)  // 기본값 20으로 증가
-    workChan := make(chan *pb.SensorData, 2000)     // 버퍼 크기 2000으로 증가
+    // 워커 수와 링 버퍼 초기화
+    workerCount := getConfigInt("WORKER_COUNT", 20)
+    ringBuffer := NewRingBuffer(5000) // 5000개 크기의 링 버퍼
     resultChan := make(chan struct {
         device    string
         timestamp string
@@ -536,7 +608,7 @@ func processMQTTData(client pb.SensorServiceClient) {
         statsLock.Unlock()
     }
 
-    // 워커 모니터링 고루틴
+    // 워커 모니터링 고루틴 (이전과 동일)
     go func() {
         ticker := time.NewTicker(30 * time.Second)
         defer ticker.Stop()
@@ -566,153 +638,133 @@ func processMQTTData(client pb.SensorServiceClient) {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
+    // 데이터 수신 고루틴
+    go func() {
+        for {
+            select {
+            case data, ok := <-dataChannel:
+                if !ok {
+                    return
+                }
+                ringBuffer.Put(data)
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    // 워커 고루틴들
     var wg sync.WaitGroup
     for i := 0; i < workerCount; i++ {
         wg.Add(1)
         go func(workerID int) {
             defer wg.Done()
-            
             stats := workerStats[workerID]
             log.Printf("Worker %d 시작", workerID)
 
             for {
                 select {
-                case data, ok := <-workChan:
-                    if !ok {
-                        log.Printf("Worker %d: 채널이 닫혔습니다. 종료합니다.", workerID)
-                        return
-                    }
-
-                    processStart := time.Now()
-                    log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s)",
-                        workerID, data.Device, data.Timestamp)
-
-                    // 파일 쓰기 시도 (타임아웃 추가)
-                    fileErr := make(chan error, 1)
-                    done := make(chan bool)
-                    go func(d *pb.SensorData) {
-                        defer close(done)
-                        if err := writeDataToFile(d); err != nil {
-                            fileErr <- err
-                        } else {
-                            fileErr <- nil
-                        }
-                    }(data)
-
-                    // 파일 쓰기 타임아웃 처리
-                    select {
-                    case <-time.After(10 * time.Second):
-                        log.Printf("Worker %d: 파일 쓰기 타임아웃 (디바이스: %s)",
-                            workerID, data.Device)
-                        fileErr <- fmt.Errorf("file write timeout")
-                    case <-done:
-                        // 파일 쓰기 완료
-                    }
-
-                    var err error
-                    if transportMode == TransportMQTT {
-                        err = publishToMQTT(data)
-                    } else {
-                        // gRPC 타임아웃 증가
-                        gctx, gcancel := context.WithTimeout(ctx, 30*time.Second)
-                        _, err = client.SendSensorData(gctx, data)
-                        gcancel()
-                    }
-
-                    // 파일 저장 결과 확인
-                    if ferr := <-fileErr; ferr != nil {
-                        log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
-                            workerID, data.Device, ferr)
-                        stats.mutex.Lock()
-                        stats.errorCount++
-                        stats.mutex.Unlock()
-                    }
-
-                    // 처리 통계 업데이트
-                    stats.mutex.Lock()
-                    stats.processedCount++
-                    stats.lastProcessed = time.Now()
-                    if err != nil {
-                        stats.errorCount++
-                    }
-                    stats.mutex.Unlock()
-
-                    // 처리 시간이 너무 긴 경우 경고
-                    processTime := time.Since(processStart)
-                    if processTime > 5*time.Second {
-                        log.Printf("경고: Worker %d의 처리 시간이 길어짐 (%v)", workerID, processTime)
-                    }
-
-                    resultChan <- struct {
-                        device    string
-                        timestamp string
-                        err       error
-                    }{
-                        device:    data.Device,
-                        timestamp: data.Timestamp,
-                        err:       err,
-                    }
-
                 case <-ctx.Done():
                     log.Printf("Worker %d: 컨텍스트 취소로 종료합니다.", workerID)
                     return
+                default:
+                    // 링 버퍼에서 데이터 가져오기
+                    if data, ok := ringBuffer.Get(); ok {
+                        processStart := time.Now()
+                        log.Printf("Worker %d: 데이터 처리 시작 (디바이스: %s, 타임스탬프: %s, 버퍼 크기: %d)",
+                            workerID, data.Device, data.Timestamp, ringBuffer.Len())
+
+                        // 파일 쓰기 시도
+                        fileErr := make(chan error, 1)
+                        done := make(chan bool)
+                        go func(d *pb.SensorData) {
+                            defer close(done)
+                            if err := writeDataToFile(d); err != nil {
+                                fileErr <- err
+                            } else {
+                                fileErr <- nil
+                            }
+                        }(data)
+
+                        // 파일 쓰기 타임아웃 처리
+                        select {
+                        case <-time.After(10 * time.Second):
+                            log.Printf("Worker %d: 파일 쓰기 타임아웃 (디바이스: %s)",
+                                workerID, data.Device)
+                            fileErr <- fmt.Errorf("file write timeout")
+                        case <-done:
+                            // 파일 쓰기 완료
+                        }
+
+                        var err error
+                        if transportMode == TransportMQTT {
+                            err = publishToMQTT(data)
+                        } else {
+                            gctx, gcancel := context.WithTimeout(ctx, 30*time.Second)
+                            _, err = client.SendSensorData(gctx, data)
+                            gcancel()
+                        }
+
+                        // 처리 결과 업데이트
+                        if ferr := <-fileErr; ferr != nil {
+                            log.Printf("Worker %d: 파일 저장 실패 (디바이스: %s): %v",
+                                workerID, data.Device, ferr)
+                            stats.mutex.Lock()
+                            stats.errorCount++
+                            stats.mutex.Unlock()
+                        }
+
+                        stats.mutex.Lock()
+                        stats.processedCount++
+                        stats.lastProcessed = time.Now()
+                        if err != nil {
+                            stats.errorCount++
+                        }
+                        stats.mutex.Unlock()
+
+                        processTime := time.Since(processStart)
+                        if processTime > 5*time.Second {
+                            log.Printf("경고: Worker %d의 처리 시간이 길어짐 (%v)", workerID, processTime)
+                        }
+
+                        resultChan <- struct {
+                            device    string
+                            timestamp string
+                            err       error
+                        }{
+                            device:    data.Device,
+                            timestamp: data.Timestamp,
+                            err:       err,
+                        }
+                    } else {
+                        // 데이터가 없으면 잠시 대기
+                        time.Sleep(100 * time.Millisecond)
+                    }
                 }
             }
         }(i)
     }
 
-    // 메인 프로세스 모니터링
-    log.Printf("메인 프로세스: 데이터 채널 모니터링 시작")
-    healthCheckTicker := time.NewTicker(1 * time.Minute)
-    defer healthCheckTicker.Stop()
+    // 버퍼 상태 모니터링
+    go func() {
+        ticker := time.NewTicker(10 * time.Second)
+        defer ticker.Stop()
 
-    // 채널 상태 모니터링을 위한 카운터
-    var (
-        totalReceived   int64
-        totalDropped    int64
-        lastStatTime    = time.Now()
-        statUpdateTicker = time.NewTicker(1 * time.Minute)
-    )
-    defer statUpdateTicker.Stop()
-
-    for {
-        select {
-        case data, ok := <-dataChannel:
-            if !ok {
-                log.Printf("메인 프로세스: 데이터 채널이 닫혔습니다.")
-                close(workChan)
-                wg.Wait()
+        for {
+            select {
+            case <-ticker.C:
+                bufferSize := ringBuffer.Len()
+                log.Printf("링 버퍼 상태 - 현재 크기: %d", bufferSize)
+                if bufferSize > 4000 { // 80% 이상 차면 경고
+                    log.Printf("경고: 링 버퍼가 거의 가득 찼습니다 (%d/5000)", bufferSize)
+                }
+            case <-ctx.Done():
                 return
             }
-            atomic.AddInt64(&totalReceived, 1)
-            
-            select {
-            case workChan <- data:
-                // 데이터가 성공적으로 전송됨
-            case <-time.After(5 * time.Second):
-                atomic.AddInt64(&totalDropped, 1)
-                log.Printf("메인 프로세스: 작업 채널이 가득 찼습니다. 데이터 드롭: %s (총 드롭: %d/%d)",
-                    data.Device, atomic.LoadInt64(&totalDropped), atomic.LoadInt64(&totalReceived))
-            }
-
-        case <-statUpdateTicker.C:
-            received := atomic.LoadInt64(&totalReceived)
-            dropped := atomic.LoadInt64(&totalDropped)
-            duration := time.Since(lastStatTime)
-            rate := float64(received) / duration.Minutes()
-            
-            log.Printf("채널 상태 - 수신율: %.2f/분, 총 수신: %d, 총 드롭: %d (%.2f%%)",
-                rate, received, dropped, float64(dropped)/float64(received)*100)
-            
-            // 드롭율이 높은 경우 경고
-            if dropped > 0 && float64(dropped)/float64(received) > 0.1 { // 10% 이상
-                log.Printf("경고: 높은 데이터 드롭율 감지 (%.2f%%)", float64(dropped)/float64(received)*100)
-            }
-
-        case <-healthCheckTicker.C:
-            // 워커 상태 체크는 별도 고루틴에서 처리
         }
-    }
+    }()
+
+    wg.Wait()
 }
 
 func processDBData(db *sql.DB, client pb.SensorServiceClient) {
